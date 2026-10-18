@@ -8,7 +8,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from app.activities.jobs import router as jobs_router
+from app.activities.jobs import (
+    DrainRequest as DrainRequest,
+    JobCreate as JobCreate,
+    JobStatus as JobStatus,
+    JobView as JobView,
+    Priority as Priority,
+    router as jobs_router,
+)
 from app.db import Base, engine
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
