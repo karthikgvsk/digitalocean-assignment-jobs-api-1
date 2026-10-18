@@ -1,13 +1,16 @@
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
-from app.main import _idempotency, _jobs, app
+from app.db import SessionLocal
+from app.main import app
 
 client = TestClient(app)
 
 
 def setup_function() -> None:
-    _jobs.clear()
-    _idempotency.clear()
+    with SessionLocal() as session:
+        session.execute(text("TRUNCATE TABLE outbox, jobs CASCADE"))
+        session.commit()
 
 
 def test_submit_and_fetch_job() -> None:
@@ -36,4 +39,6 @@ def test_cancel_queued_job() -> None:
 
 def test_drain_requires_confirmation() -> None:
     assert client.post("/queue/drain", json={"confirm": False}).status_code == 400
-    assert client.post("/queue/drain", json={"confirm": True}).status_code == 200
+    response = client.post("/queue/drain", json={"confirm": True})
+    assert response.status_code == 200
+    assert response.json()["state"] == "draining"
