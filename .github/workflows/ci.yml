@@ -37,7 +37,10 @@ jobs:
           cache: pip
       - run: pip install -e '.[dev]'
       - run: ruff check .
-      - run: pytest
+      - name: Unit tests
+        run: pytest tests/test_unit.py
+      - name: Integration tests (PostgreSQL + Redis)
+        run: pytest tests/test_api.py tests/test_integration.py
         env:
           DATABASE_URL: postgresql+psycopg://jobs:jobs@localhost:5432/jobs
           REDIS_URL: redis://localhost:6379/0
