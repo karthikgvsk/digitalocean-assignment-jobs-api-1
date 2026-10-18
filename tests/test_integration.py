@@ -56,8 +56,7 @@ def test_outbox_dispatches_to_priority_stream(
 
     with redis.Redis.from_url(REDIS_URL, decode_responses=True) as redis_client:
         assert len(redis_client.xrange(expected_stream)) == 1
-        for stream in STREAMS:
-            stream_name = f"jobs:{stream.removeprefix('jobs:')}" if stream.startswith("jobs:") else stream
+        for stream_name in STREAMS:
             if stream_name != expected_stream:
                 assert redis_client.xlen(stream_name) == 0
         fields = redis_client.xrange(expected_stream)[0][1]
