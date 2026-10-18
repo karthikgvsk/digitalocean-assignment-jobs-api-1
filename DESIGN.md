@@ -246,6 +246,64 @@ The workflow checks Ruff linting, runs the unit suite, runs API/integration test
 
 ## 8. Job lifecycle
 
+### Sequence diagram: submit, dispatch, execute, and complete
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant API as FastAPI API
+    participant DB as PostgreSQL
+    participant Dispatcher as Outbox dispatcher
+    participant Queue as Redis Streams / Valkey
+    participant Worker as Worker
+    participant Handler as Task handler
+
+    Client->>API: POST /jobs (request, optional run_at)
+    API->>DB: BEGIN; insert job(status=queued)
+    API->>DB: insert outbox record
+    API->>DB: COMMIT
+    API-->>Client: 202 Accepted + job ID
+
+    loop Approximately once per second
+        Dispatcher->>DB: Select unpublished outbox rows that are due
+        DB-->>Dispatcher: Eligible rows
+        alt Job is not due yet
+            Dispatcher->>Dispatcher: Leave outbox row unpublished
+        else Job is due
+            Dispatcher->>Queue: XADD to priority stream
+            Dispatcher->>DB: Set outbox.published_at; commit
+        end
+    end
+
+    Worker->>Queue: XREADGROUP from priority streams
+    Queue-->>Worker: Message containing job ID
+    Worker->>DB: Lock and read job row
+    alt Job is no longer queued or does not exist
+        Worker->>Queue: XACK / skip message
+    else Job is queued
+        Worker->>DB: Set running; increment attempts; commit
+        Worker->>Handler: Execute in child process with timeout
+        alt Handler succeeds before timeout
+            Handler-->>Worker: Result
+            Worker->>DB: Set succeeded; clear error; commit
+            Note over Worker,DB: Current schema logs result; it does not persist a result field
+            Worker->>Queue: XACK message
+        else Handler fails or times out
+            Handler-->>Worker: Error / timeout
+            Worker->>DB: Persist error and updated timestamp
+            alt Retries remain
+                Worker->>DB: Set queued; insert retry outbox row; commit
+            else Retry limit exhausted
+                Worker->>DB: Set dead_lettered; commit
+            end
+            Worker->>Queue: XACK original message after state is persisted
+        end
+    end
+```
+
+The sequence shows the normal path and the retry branch. Redis publication and the database update marking an outbox row as published are separate operations, so duplicate messages are possible if publication succeeds but the database commit fails. The worker uses PostgreSQL state checks to skip jobs that are no longer eligible; this does not provide exactly-once execution for arbitrary external side effects.
+
 ### State diagram
 
 ```mermaid
