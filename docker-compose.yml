@@ -30,6 +30,18 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
+  dispatcher:
+    build: .
+    command: ["python", "-m", "app.dispatcher"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://jobs:jobs@postgres:5432/jobs
+      REDIS_URL: redis://redis:6379/0
+      DISPATCHER_POLL_INTERVAL_SEC: 1
+      DISPATCHER_BATCH_SIZE: 100
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
   worker:
     build: .
     command: ["python", "-m", "app.worker"]
