@@ -6,6 +6,43 @@ This service accepts work over HTTP, persists job state and dispatch intent in P
 
 **Design principle:** PostgreSQL is the source of truth for job lifecycle state. Redis Streams is the delivery/dispatch mechanism, not the authoritative job record.
 
+## Layered API architecture
+
+The HTTP API is split into three layers so transport concerns, job rules, and persistence can evolve independently.
+
+| Layer | Location | Responsibilities |
+|---|---|---|
+| **Activity layer** | `app/activities/jobs.py` | FastAPI routes, Pydantic request/response validation, HTTP status mapping, headers, and response serialization. It delegates work instead of issuing SQL or Redis commands directly. |
+| **Business logic layer** | `app/services.py` | Job lifecycle rules, idempotent submission behavior, cancellation/retry eligibility, queue-drain confirmation, and domain exceptions independent of HTTP. |
+| **Model / data-access layer** | `app/repositories.py` and `app/db.py` | Repository operations and transaction boundaries; SQLAlchemy ORM models, sessions, and PostgreSQL engine configuration. |
+| **Application bootstrap** | `app/main.py` | Creates the FastAPI app, initializes the schema for this assignment, registers activity routes, and exposes health/metrics endpoints. |
+
+The dispatcher and worker remain separate deployable processes. They share the database engine's connection/pool timeout configuration and the common Redis client factory; the API's activity/service/repository split does not combine these runtime components.
+
+## Network timeouts and retry policy
+
+Network operations are bounded to avoid indefinitely tying up API threads or background workers. Defaults are configurable through environment variables.
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| `DB_CONNECT_TIMEOUT_SEC` | 5 seconds | PostgreSQL connection establishment timeout |
+| `DB_POOL_TIMEOUT_SEC` | 5 seconds | Maximum wait for a SQLAlchemy pooled connection |
+| `DB_STATEMENT_TIMEOUT_MS` | 5000 ms | PostgreSQL server-side statement timeout |
+| `REDIS_SOCKET_CONNECT_TIMEOUT_SEC` | 2 seconds | Redis/Valkey connection establishment timeout |
+| `REDIS_SOCKET_TIMEOUT_SEC` | 3 seconds | Redis/Valkey socket operation timeout |
+| `EXTERNAL_RETRY_ATTEMPTS` | 3 attempts | Total attempts for retry-enabled operations |
+| `EXTERNAL_RETRY_BASE_DELAY_SEC` | 0.1 seconds | Initial exponential-backoff ceiling |
+| `EXTERNAL_RETRY_MAX_DELAY_SEC` | 1 second | Maximum backoff ceiling |
+
+- **Backoff:** retry-enabled database operations use capped exponential backoff with full jitter. With the defaults, delay ceilings grow from 100 ms to 200 ms and are capped at 1 second.
+- **Database retry classification:** retry connection/transport errors such as SQLAlchemy `OperationalError`, `InterfaceError`, and invalidated connections. Do not retry validation errors or integrity/constraint violations.
+- **Redis retry classification:** the shared Redis client retries connection and socket-timeout failures using redis-py's retry support. API drain, dispatcher, and worker use this shared client factory.
+- **Transactional safety:** database repository operations create a fresh session for each attempt. Job creation reuses a stable UUID across retries and checks the idempotency key. The dispatcher may publish an `XADD` before its database commit succeeds, so a retry can duplicate a message; delivery remains at-least-once and handlers must tolerate duplicates.
+- **Failure response:** if retries are exhausted, the error is allowed to propagate to the activity layer (database failures become server errors; Redis queue-control failures return `503 Service Unavailable`). Retries are bounded; there is no infinite retry loop.
+- **Scope:** the shared engine and Redis client timeouts apply to API, dispatcher, and worker. Explicit database retry wrappers are used by API repository operations and dispatcher batches; worker lifecycle transactions rely on bounded DB timeouts and should not be blindly retried as whole units because they can surround task side effects or enqueue a retry record.
+
+
+
 ## 2. Goals and scope
 
 ### In scope
