@@ -1,7 +1,6 @@
 """HTTP API for asynchronous job submission and status inspection."""
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -14,7 +13,7 @@ import redis
 from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 
 from app.db import Base, Job, Outbox, SessionLocal, engine, utcnow
 
@@ -70,53 +69,11 @@ class DrainRequest(BaseModel):
     confirm: bool = False
 
 
-def publish_outbox_once() -> int:
-    """Publish committed outbox records; duplicate publication is safe for idempotent workers."""
-    client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    published = 0
-    try:
-        with SessionLocal() as session:
-            rows = session.scalars(
-                select(Outbox)
-                .join(Job, Job.id == Outbox.job_id)
-                .where(
-                    Outbox.published_at.is_(None),
-                    or_(Job.run_at.is_(None), Job.run_at <= utcnow()),
-                )
-                .order_by(Outbox.created_at)
-                .limit(100)
-                .with_for_update(skip_locked=True)
-            ).all()
-            for row in rows:
-                client.xadd(row.stream, {"job_id": str(row.job_id), "payload": __import__("json").dumps(row.payload)})
-                row.published_at = utcnow()
-                published += 1
-            session.commit()
-            OUTBOX_PENDING.set(session.scalar(select(func.count()).select_from(Outbox).where(Outbox.published_at.is_(None))) or 0)
-    finally:
-        client.close()
-    return published
-
-
-async def outbox_loop() -> None:
-    while True:
-        try:
-            await asyncio.to_thread(publish_outbox_once)
-        except Exception:
-            logger.exception("outbox_publish_failed")
-        await asyncio.sleep(1)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Schema creation is retained for this assignment; use migrations in production.
     Base.metadata.create_all(engine)
-    task = asyncio.create_task(outbox_loop())
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
 
 
 app = FastAPI(title="DigitalOcean Async Jobs API", version="0.1.0", lifespan=lifespan)
