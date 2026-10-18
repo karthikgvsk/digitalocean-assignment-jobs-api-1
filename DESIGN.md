@@ -251,58 +251,52 @@ The workflow checks Ruff linting, runs the unit suite, runs API/integration test
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Client
-    participant API as FastAPI API
-    participant DB as PostgreSQL
-    participant Dispatcher as Outbox dispatcher
-    participant Queue as Redis Streams / Valkey
-    participant Worker as Worker
-    participant Handler as Task handler
+    participant C as Client
+    participant A as API
+    participant D as PostgreSQL
+    participant O as Outbox Dispatcher
+    participant Q as Redis Streams
+    participant W as Worker
+    participant H as Task Handler
 
-    Client->>API: POST /jobs (request, optional run_at)
-    API->>DB: BEGIN; insert job(status=queued)
-    API->>DB: insert outbox record
-    API->>DB: COMMIT
-    API-->>Client: 202 Accepted + job ID
+    C->>A: POST /jobs with job request
+    A->>D: Insert queued job and outbox row in one transaction
+    D-->>A: Commit successful
+    A-->>C: 202 Accepted with job ID
 
-    loop Approximately once per second
-        Dispatcher->>DB: Select unpublished outbox rows that are due
-        DB-->>Dispatcher: Eligible rows
-        alt Job is not due yet
-            Dispatcher->>Dispatcher: Leave outbox row unpublished
-        else Job is due
-            Dispatcher->>Queue: XADD to priority stream
-            Dispatcher->>DB: Set outbox.published_at; commit
-        end
+    loop Poll about once per second
+        O->>D: Select unpublished rows that are due
+        D-->>O: Return eligible rows
+        O->>Q: XADD job to priority stream
+        O->>D: Mark outbox row published
     end
 
-    Worker->>Queue: XREADGROUP from priority streams
-    Queue-->>Worker: Message containing job ID
-    Worker->>DB: Lock and read job row
-    alt Job is no longer queued or does not exist
-        Worker->>Queue: XACK / skip message
+    W->>Q: XREADGROUP for new messages
+    Q-->>W: Return job ID
+    W->>D: Lock and check job status
+    alt Job is missing or no longer queued
+        W->>Q: XACK message without execution
     else Job is queued
-        Worker->>DB: Set running; increment attempts; commit
-        Worker->>Handler: Execute in child process with timeout
-        alt Handler succeeds before timeout
-            Handler-->>Worker: Result
-            Worker->>DB: Set succeeded; clear error; commit
-            Note over Worker,DB: Current schema logs result; it does not persist a result field
-            Worker->>Queue: XACK message
-        else Handler fails or times out
-            Handler-->>Worker: Error / timeout
-            Worker->>DB: Persist error and updated timestamp
+        W->>D: Set running and increment attempts
+        W->>H: Execute task with timeout
+        alt Task succeeds
+            H-->>W: Return result
+            W->>D: Set succeeded and clear error
+            W->>Q: XACK message
+        else Task fails or times out
+            H-->>W: Return error or timeout
+            W->>D: Record error
             alt Retries remain
-                Worker->>DB: Set queued; insert retry outbox row; commit
+                W->>D: Set queued and insert retry outbox row
             else Retry limit exhausted
-                Worker->>DB: Set dead_lettered; commit
+                W->>D: Set dead_lettered
             end
-            Worker->>Queue: XACK original message after state is persisted
+            W->>Q: XACK original message after state commit
         end
     end
 ```
 
-The sequence shows the normal path and the retry branch. Redis publication and the database update marking an outbox row as published are separate operations, so duplicate messages are possible if publication succeeds but the database commit fails. The worker uses PostgreSQL state checks to skip jobs that are no longer eligible; this does not provide exactly-once execution for arbitrary external side effects.
+The sequence shows the normal path and retry branch. Redis publication and marking an outbox row as published are separate operations, so duplicate messages are possible if publication succeeds but the database commit fails. The worker checks PostgreSQL state to skip jobs that are no longer eligible. This does not guarantee exactly-once execution of arbitrary external side effects. The current schema logs successful task results but does not persist a result field.
 
 ### State diagram
 
