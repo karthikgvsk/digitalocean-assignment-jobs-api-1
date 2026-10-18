@@ -1,6 +1,7 @@
 """Standalone transactional outbox dispatcher process."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -9,14 +10,13 @@ import time
 import redis
 from sqlalchemy import func, or_, select
 
-from app.db import Job, Outbox, SessionLocal, Base, engine, utcnow
+from app.db import Base, Job, Outbox, SessionLocal, engine, utcnow
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 POLL_INTERVAL_SEC = max(0.1, float(os.getenv("DISPATCHER_POLL_INTERVAL_SEC", "1")))
 BATCH_SIZE = max(1, int(os.getenv("DISPATCHER_BATCH_SIZE", "100")))
-STREAMS = {"high": "jobs:high", "normal": "jobs:normal", "low": "jobs:low"}
 stopping = False
 
 
@@ -46,7 +46,7 @@ def publish_outbox_once() -> int:
             for row in rows:
                 client.xadd(
                     row.stream,
-                    {"job_id": str(row.job_id), "payload": __import__("json").dumps(row.payload)},
+                    {"job_id": str(row.job_id), "payload": json.dumps(row.payload)},
                 )
                 row.published_at = utcnow()
                 published += 1
