@@ -241,6 +241,19 @@ docker build -t jobs-api:local .
 
 Each test resets the dedicated test database tables and Redis state to isolate scenarios.
 
+### Latest verification status
+
+As of **18 October 2026**, the latest GitHub Actions run for commit `40d7c965a58960bcc23dd3b137c19f510d65428a` completed successfully: [CI run #46](https://github.com/karthikgvsk/digitalocean-assignment-jobs-api-1/actions/runs/39136483080).
+
+| Check | Result |
+|---|---|
+| Ruff lint checks (`ruff check .`) | Passed |
+| Unit tests | Passed |
+| API/integration tests with PostgreSQL and Redis service containers | Passed |
+| Docker image build | Passed |
+
+The user has also confirmed that the DigitalOcean deployment succeeded. This is a deployment-status confirmation, not yet a verified live end-to-end smoke test: CI uses disposable PostgreSQL and Redis services, rather than the deployed DigitalOcean resources.
+
 ### What CI verifies—and does not
 
 The workflow checks Ruff linting, runs the unit suite, runs API/integration tests against PostgreSQL and Redis, and builds the Docker image. These checks validate the listed behaviors in CI, but they do **not** currently constitute load/stress testing, chaos testing, a deployed-environment smoke test, or verification of production service-level objectives. Dedicated tests for scheduled `run_at` behavior, health/metrics endpoints, dependency failures, stale pending-message recovery, worker-crash reconciliation, and strict priority ordering are not currently included.
