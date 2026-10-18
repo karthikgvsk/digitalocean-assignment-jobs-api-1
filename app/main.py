@@ -5,18 +5,13 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-import redis
 from fastapi import FastAPI, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.activities.jobs import REDIS_URL, router as jobs_router
 from app.db import Base, engine
-from app.resilience import create_redis_client
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger(__name__)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Schema creation is retained for this assignment; use versioned migrations in production.
