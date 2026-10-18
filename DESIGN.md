@@ -121,10 +121,14 @@ These are design goals; numeric service-level objectives have not yet been bench
 flowchart TB
     CLIENT[Client / API Consumer]
     subgraph APP[DigitalOcean App Platform]
-        API[FastAPI API Service\napp/main.py]
-        DISPATCH[Outbox Dispatcher Loop\nRuns in API process]
-        WORKER[Worker Service\napp/worker.py]
-        HANDLERS[Task Handler Registry\necho / sleep / fail]
+        API[FastAPI Activity Layer]
+        BIZ[Business Logic Layer]
+        REPO[Model / Repository Layer]
+        DISPATCH[Outbox Dispatcher Service]
+        WORKER[Worker Service]
+        HANDLERS[Task Handler Registry]
+        API -->|1. Validate request / map response| BIZ
+        BIZ -->|2. Apply job rules| REPO
     end
     subgraph DATA[Managed Data Services]
         PG[(PostgreSQL)]
@@ -144,17 +148,17 @@ flowchart TB
     end
     SCRAPER[Prometheus Scraper / Metrics Consumer]
 
-    CLIENT -->|1. Submit / query / cancel| API
-    API -->|2. Read or update job state| JOBS
-    API -->|3. Atomic insert: job + outbox| OUTBOX
-    DISPATCH -->|4. Poll due unpublished records| OUTBOX
-    DISPATCH -->|5. XADD to priority stream| VK
-    WORKER -->|6. XREADGROUP: receive job| VK
-    WORKER -->|7. Lock job; set running / outcome| JOBS
-    WORKER -->|8. XACK after durable state update| VK
-    WORKER -->|9. Invoke registered task| HANDLERS
-    API -->|10. Expose /metrics| SCRAPER
-    API -->|11. Set drain control flag| CONTROL
+    CLIENT -->|3. Submit / query / cancel| API
+    REPO -->|4. SQLAlchemy transactions| JOBS
+    REPO -->|5. Atomic job + outbox insert| OUTBOX
+    DISPATCH -->|6. Poll due unpublished records| OUTBOX
+    DISPATCH -->|7. XADD to priority stream| VK
+    WORKER -->|8. XREADGROUP: receive job| VK
+    WORKER -->|9. Lock job; set running / outcome| JOBS
+    WORKER -->|10. XACK after durable state update| VK
+    WORKER -->|11. Invoke registered task| HANDLERS
+    API -->|12. Expose /metrics| SCRAPER
+    BIZ -->|13. Set drain control flag| CONTROL
 ```
 
 The boxes inside the data-services boundary are logical tables/streams, not separate deployed services. The `outbox` table lives in PostgreSQL. The dispatcher is a separate process/service, alongside the API and worker, and can be scaled independently.
