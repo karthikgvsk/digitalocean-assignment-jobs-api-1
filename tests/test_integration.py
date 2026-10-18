@@ -1,7 +1,7 @@
 """Integration tests for PostgreSQL, the transactional outbox, Valkey, and worker."""
 
-import redis
 import pytest
+import redis
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
