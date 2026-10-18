@@ -180,16 +180,19 @@ The boxes inside the data-services boundary are logical tables/streams, not sepa
 
 ```mermaid
 flowchart TB
-    GH[GitHub Repository: main] --> CI[GitHub Actions: lint, tests, Docker build]
-    GH --> APIAPP[DigitalOcean App Platform: Web Service]
-    GH --> WORKERAPP[DigitalOcean App Platform: Worker]
+    GH[GitHub Repository: main] --> CI[GitHub Actions: lint, unit and integration tests, Docker build]
+    GH --> APIAPP[DigitalOcean App Platform: API Web Service]
+    GH --> DISPATCH[DigitalOcean App Platform: Dispatcher Worker]
+    GH --> WORKERAPP[DigitalOcean App Platform: Job Worker]
     APIAPP --> PG[(Managed PostgreSQL)]
     APIAPP --> VK[(Managed Valkey)]
+    DISPATCH --> PG
+    DISPATCH --> VK
     WORKERAPP --> PG
     WORKERAPP --> VK
 ```
 
-The API and worker use the same repository and Dockerfile but different start commands:
+The API, dispatcher, and worker use the same repository and Dockerfile but separate start commands:
 - API: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
 - Dispatcher: `python -m app.dispatcher`
 - Worker: `python -m app.worker`
