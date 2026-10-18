@@ -109,7 +109,7 @@ def submit_job(
             run_at=request.run_at,
             idempotency_key=idempotency_key,
         )
-    except Exception as exc:
+    except (JobNotFoundError, InvalidJobStateError, ConfirmationRequiredError, QueueUnavailableError) as exc:
         _raise_http_error(exc)
     if replayed:
         response.headers["Idempotency-Replayed"] = "true"
@@ -125,7 +125,7 @@ def list_jobs(
         return [as_view(job) for job in services.list_jobs(
             status=job_status.value if job_status else None, limit=limit
         )]
-    except Exception as exc:
+    except (JobNotFoundError, InvalidJobStateError, ConfirmationRequiredError, QueueUnavailableError) as exc:
         _raise_http_error(exc)
 
 
@@ -133,7 +133,7 @@ def list_jobs(
 def get_job(job_id: UUID) -> JobView:
     try:
         return as_view(services.get_job(job_id))
-    except Exception as exc:
+    except (JobNotFoundError, InvalidJobStateError, ConfirmationRequiredError, QueueUnavailableError) as exc:
         _raise_http_error(exc)
 
 
@@ -141,7 +141,7 @@ def get_job(job_id: UUID) -> JobView:
 def cancel_job(job_id: UUID) -> JobView:
     try:
         return as_view(services.cancel_job(job_id))
-    except Exception as exc:
+    except (JobNotFoundError, InvalidJobStateError, ConfirmationRequiredError, QueueUnavailableError) as exc:
         _raise_http_error(exc)
 
 
@@ -149,7 +149,7 @@ def cancel_job(job_id: UUID) -> JobView:
 def queue_depth() -> dict[str, int]:
     try:
         return services.queue_depth()
-    except Exception as exc:
+    except (JobNotFoundError, InvalidJobStateError, ConfirmationRequiredError, QueueUnavailableError) as exc:
         _raise_http_error(exc)
 
 
@@ -157,7 +157,7 @@ def queue_depth() -> dict[str, int]:
 def drain_queue(request: DrainRequest) -> dict[str, Any]:
     try:
         return services.drain_queue(request.confirm)
-    except Exception as exc:
+    except (JobNotFoundError, InvalidJobStateError, ConfirmationRequiredError, QueueUnavailableError) as exc:
         _raise_http_error(exc)
 
 
@@ -165,5 +165,5 @@ def drain_queue(request: DrainRequest) -> dict[str, Any]:
 def retry_job(job_id: UUID) -> JobView:
     try:
         return as_view(services.retry_job(job_id))
-    except Exception as exc:
+    except (JobNotFoundError, InvalidJobStateError, ConfirmationRequiredError, QueueUnavailableError) as exc:
         _raise_http_error(exc)
