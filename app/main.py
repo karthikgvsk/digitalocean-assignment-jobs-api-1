@@ -13,7 +13,7 @@ import redis
 from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.db import Base, Job, Outbox, SessionLocal, engine, utcnow
 
