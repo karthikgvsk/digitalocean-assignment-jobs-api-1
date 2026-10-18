@@ -6,8 +6,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from app.db import Base, Outbox, SessionLocal, engine
-from app.main import REDIS_URL, app
 from app.dispatcher import publish_outbox_once
+from app.main import REDIS_URL, app
 from app.worker import CONSUMER, GROUP, STREAMS, ensure_groups, process
 
 client = TestClient(app)
