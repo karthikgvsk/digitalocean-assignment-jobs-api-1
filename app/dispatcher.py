@@ -7,7 +7,6 @@ import os
 import signal
 import time
 
-import redis
 from sqlalchemy import func, or_, select
 
 from app.db import Base, Job, Outbox, SessionLocal, engine, utcnow
