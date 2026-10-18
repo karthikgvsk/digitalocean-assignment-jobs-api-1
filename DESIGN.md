@@ -81,18 +81,59 @@ These are design goals; numeric service-level objectives have not yet been bench
 ### Component diagram
 
 ```mermaid
-flowchart LR
-    Client[API Client] -->|HTTPS / REST| API[FastAPI Web Service]
-    API -->|read/write jobs and outbox| PG[(PostgreSQL)]
-    API -->|background dispatcher| OUTBOX[Transactional Outbox]
-    OUTBOX -->|XADD| VALKEY[(Redis Streams / Valkey)]
-    VALKEY -->|consumer group reads| WORKER[Background Worker]
-    WORKER -->|claim/update job state| PG
-    WORKER --> HANDLERS[Task Handler Registry]
-    API -->|/metrics| METRICS[Prometheus Scraper]
+flowchart TB
+    CLIENT[Client / API Consumer]
+    subgraph APP[DigitalOcean App Platform]
+        API[FastAPI API Service\napp/main.py]
+        DISPATCH[Outbox Dispatcher Loop\nRuns in API process]
+        WORKER[Worker Service\napp/worker.py]
+        HANDLERS[Task Handler Registry\necho / sleep / fail]
+    end
+    subgraph DATA[Managed Data Services]
+        PG[(PostgreSQL)]
+        JOBS[(jobs table)]
+        OUTBOX[(outbox table)]
+        VK[(Valkey / Redis Streams)]
+        HIGH[jobs:high]
+        NORMAL[jobs:normal]
+        LOW[jobs:low]
+        CONTROL[jobs:drain flag]
+        VK --- HIGH
+        VK --- NORMAL
+        VK --- LOW
+        VK --- CONTROL
+        PG --- JOBS
+        PG --- OUTBOX
+    end
+    SCRAPER[Prometheus Scraper / Metrics Consumer]
+
+    CLIENT -->|HTTP requests| API
+    API -->|read / update job state| JOBS
+    API -->|same DB transaction: insert job + outbox intent| OUTBOX
+    DISPATCH -->|poll due unpublished rows| OUTBOX
+    DISPATCH -->|XADD to priority-specific stream| VK
+    WORKER -->|XREADGROUP from streams| VK
+    WORKER -->|lock / transition job state| JOBS
+    WORKER --> HANDLERS
+    WORKER -->|XACK after state is persisted| VK
+    API -->|GET /metrics| SCRAPER
+    API -->|set drain flag| CONTROL
 ```
 
-The outbox is a table in PostgreSQL, not a separate service. The API process runs a periodic dispatcher loop that publishes eligible outbox rows to Redis Streams.
+The boxes inside the data-services boundary are logical tables/streams, not separate deployed services. The `outbox` table lives in PostgreSQL, while the dispatcher is a background loop running inside the API process. The worker is a separate process/service and can be scaled independently from the API.
+
+**Responsibilities and data flow**
+
+1. **Client/API consumer:** submits a job with its task type, JSON payload, priority, retry limit, timeout, optional `run_at`, and optional `Idempotency-Key`.
+2. **FastAPI service:** validates the request, checks an idempotency key when supplied, then writes the `jobs` row and its corresponding `outbox` row in one PostgreSQL transaction. It returns `202 Accepted` after the transaction commits; it does not wait for task execution.
+3. **PostgreSQL:** owns the durable job state and enqueue intent. Job status and attempt count remain authoritative here; Redis stream contents are not the source of truth.
+4. **Outbox dispatcher:** polls approximately once per second for unpublished rows whose job is due (`run_at` is absent or has passed). It locks eligible rows with `FOR UPDATE SKIP LOCKED`, publishes each to the priority stream, and records `published_at`.
+5. **Valkey / Redis Streams:** holds dispatch messages in `jobs:high`, `jobs:normal`, or `jobs:low`. A `job-workers` consumer group distributes new messages to worker consumers. Reading the streams together means strict global priority ordering is not guaranteed.
+6. **Worker:** loads and locks the corresponding PostgreSQL job, skips missing, cancelled, running, or terminal jobs, marks eligible jobs `running`, increments `attempts`, and executes the registered handler in a child process bounded by `timeout_sec`.
+7. **Completion/retry path:** after execution, the worker persists `succeeded` or records the error and either returns the job to `queued` with a new outbox record or marks it `dead_lettered`. It acknowledges the Redis message after persisting the resulting state.
+8. **Operations/metrics:** `GET /health` exposes basic process health, `GET /metrics` exposes the current Prometheus metrics, and `POST /queue/drain` sets a Valkey flag that pauses new worker claims. The health endpoint does not currently check dependency readiness.
+
+**Delivery and failure semantics:** the outbox closes the database/job-enqueue dual-write gap, but publishing to Redis and marking the outbox row published are not one atomic transaction. A publish can therefore be repeated if Redis accepts the message but the PostgreSQL commit fails. The worker's database state checks reduce duplicate execution of already-transitioned jobs, but arbitrary handler side effects are not exactly-once. Automatic stale pending-message reclaim and recovery of jobs stranded in `running` are not implemented yet.
 
 ### Deployment view
 
@@ -205,22 +246,41 @@ The workflow checks Ruff linting, runs the unit suite, runs API/integration test
 
 ## 8. Job lifecycle
 
+### State diagram
+
 ```mermaid
 stateDiagram-v2
-    [*] --> queued: Submit / retry
-    queued --> running: Worker claims job
+    [*] --> queued: API commits job + outbox
+    queued --> running: Worker claims eligible message
     running --> succeeded: Handler succeeds
-    running --> queued: Failure and retries remain
+    running --> queued: Failure / timeout and retries remain
     running --> dead_lettered: Retry limit exhausted
-    queued --> cancelled: Client cancellation
+    queued --> cancelled: Client cancels before claim
     failed --> queued: Manual retry
     dead_lettered --> queued: Manual retry
+    succeeded --> [*]
+    cancelled --> [*]
+    dead_lettered --> [*]
 ```
 
-- `attempts` increments when a worker begins an execution attempt.
-- With `max_retries = N`, the job may execute up to `N + 1` times in total.
-- A terminal failure is represented as `dead_lettered` in PostgreSQL; there is no separate dead-letter Redis stream.
-- A cancelled job is skipped if its message is later consumed.
+### Lifecycle narrative
+
+1. **Submission and durable acceptance.** The client calls `POST /jobs`. The API validates the request and, when an `Idempotency-Key` is supplied, returns the existing job for a repeated key. Otherwise, it inserts a `queued` job row and an outbox row in the same PostgreSQL transaction. After commit, the API returns `202 Accepted`; this confirms durable acceptance, not task completion.
+2. **Waiting for eligibility.** For an immediate job, the outbox dispatcher can publish it on its next polling pass. For a scheduled job, the row stays unpublished while `run_at` is in the future. The dispatcher polls about once per second, so the scheduled time is an earliest eligibility time rather than a guarantee of execution at that exact instant.
+3. **Dispatch.** The dispatcher selects due, unpublished outbox rows, locks them with `FOR UPDATE SKIP LOCKED`, writes a message to the stream for the job's priority, and marks the outbox row published. A transient failure is retried by a later dispatcher pass while the row remains unpublished. Because Redis publication and the PostgreSQL commit cannot be atomic together, duplicate stream messages are possible.
+4. **Claim and start.** The worker reads new messages through the `job-workers` consumer group, loads and locks the job row, and checks that the job is still `queued`. Cancelled, missing, running, or terminal jobs are acknowledged/skipped. For an eligible job, the worker sets status to `running`, increments `attempts`, commits that transition, and executes the task handler in a child process.
+5. **Successful completion.** If the handler finishes within `timeout_sec`, the worker updates the job to `succeeded`, clears its error, persists the updated timestamp, and acknowledges the stream message. The current schema does not persist the handler's result as a job field; the result is logged instead.
+6. **Failure, timeout, and retry.** If the handler raises an error or times out, the worker records the error. If retries remain, it sets the job back to `queued` and creates another outbox record so the next attempt follows the same dispatch path. Otherwise, it marks the job `dead_lettered`. The current implementation retries promptly without exponential backoff or jitter.
+7. **Cancellation.** A client can cancel a job only while its database status is `queued`. If a Redis message for that job already exists, the worker checks PostgreSQL and skips the cancelled job rather than running it. Once a worker has changed the status to `running`, the API returns `409 Conflict` for cancellation.
+8. **Manual retry.** `POST /jobs/{id}/retry` accepts jobs in `failed` or `dead_lettered`, resets the status, attempts, and error, and inserts a new outbox record. The normal dispatch and worker lifecycle then starts again.
+
+### Lifecycle invariants and caveats
+
+- `attempts` increments when a worker begins an execution attempt. With `max_retries = N`, a job can run up to `N + 1` times before terminal dead-lettering.
+- PostgreSQL is authoritative for job state; Redis Streams is the dispatch mechanism.
+- Delivery is at-least-once. Handlers should be idempotent because a message or side effect can be repeated around failures.
+- A terminal failure is stored as `dead_lettered` in PostgreSQL; there is no separate dead-letter Redis stream.
+- Automatic stale pending-message reclaim and reconciliation for jobs stranded in `running` are not implemented, so a worker crash can require recovery.
 
 ## 9. API surface
 
