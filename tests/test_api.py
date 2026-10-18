@@ -1,7 +1,8 @@
-from fastapi.testclient import TestClient
 from uuid import UUID
-from sqlalchemy import func, select, text
+
 import redis
+from fastapi.testclient import TestClient
+from sqlalchemy import func, select, text
 
 from app.db import Base, Job, Outbox, SessionLocal, engine
 from app.main import REDIS_URL, app
