@@ -9,6 +9,7 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timezone
+from uuid import UUID
 
 import redis
 from sqlalchemy import select
@@ -58,12 +59,17 @@ def process(client: redis.Redis, stream: str, message_id: str, fields: dict[str,
         client.xack(stream, GROUP, message_id)
         return
     with SessionLocal() as session:
-        job = session.scalar(select(Job).where(Job.id == job_id).with_for_update())
-        if not job or job.status in ("succeeded", "cancelled", "dead_lettered"):
+        try:
+            parsed_job_id = UUID(job_id)
+        except ValueError:
             client.xack(stream, GROUP, message_id)
             return
-        if job.run_at and job.run_at > datetime.now(timezone.utc):
-            # Keep it pending; scheduler support will re-enqueue due jobs in a later iteration.
+        job = session.scalar(select(Job).where(Job.id == parsed_job_id).with_for_update())
+        if not job or job.status in ("succeeded", "cancelled", "dead_lettered", "running"):
+            client.xack(stream, GROUP, message_id)
+            return
+        if job.status != "queued":
+            client.xack(stream, GROUP, message_id)
             return
         job.status = "running"
         job.attempts += 1
@@ -113,10 +119,15 @@ def main() -> None:
     ensure_groups(client)
     logger.info("worker_started consumer=%s concurrency=%s", CONSUMER, CONCURRENCY)
     while not stopping:
+        if client.get("jobs:drain") == "1":
+            time.sleep(0.5)
+            continue
         records = client.xreadgroup(GROUP, CONSUMER, {stream: ">" for stream in STREAMS}, count=CONCURRENCY, block=1000)
         for stream, messages in records:
             for message_id, fields in messages:
                 if stopping:
+                    break
+                if client.get("jobs:drain") == "1":
                     break
                 process(client, stream, message_id, fields)
     client.close()
