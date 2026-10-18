@@ -9,14 +9,16 @@ from fastapi import FastAPI, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.activities.jobs import (
-    DrainRequest as DrainRequest,
-    JobCreate as JobCreate,
-    JobStatus as JobStatus,
-    JobView as JobView,
-    Priority as Priority,
+    DrainRequest,
+    JobCreate,
+    JobStatus,
+    JobView,
+    Priority,
     router as jobs_router,
 )
 from app.db import Base, engine
+
+__all__ = ["DrainRequest", "JobCreate", "JobStatus", "JobView", "Priority", "REDIS_URL", "app"]
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
