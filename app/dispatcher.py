@@ -11,6 +11,7 @@ import redis
 from sqlalchemy import func, or_, select
 
 from app.db import Base, Job, Outbox, SessionLocal, engine, utcnow
+from app.resilience import create_redis_client, is_retryable_database_error, retry_transient
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -26,9 +27,9 @@ def stop(signum: int, frame: object) -> None:
     logger.info("dispatcher_shutdown_requested signal=%s", signum)
 
 
-def publish_outbox_once() -> int:
+def _publish_outbox_once() -> int:
     """Publish due outbox records; duplicates are possible across the DB/Redis boundary."""
-    client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    client = create_redis_client(REDIS_URL)
     published = 0
     try:
         with SessionLocal() as session:
@@ -58,6 +59,15 @@ def publish_outbox_once() -> int:
     finally:
         client.close()
     return published
+
+
+def publish_outbox_once() -> int:
+    """Retry transient database failures; duplicate XADD delivery remains possible."""
+    return retry_transient(
+        _publish_outbox_once,
+        should_retry=is_retryable_database_error,
+        operation_name="dispatcher_batch",
+    )
 
 
 def main() -> None:
