@@ -45,7 +45,7 @@ def retry_transient(
     for attempt in range(1, max(1, attempts) + 1):
         try:
             return operation()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - predicate below limits retries to transient errors
             if attempt >= attempts or not should_retry(exc):
                 raise
             ceiling = min(RETRY_MAX_DELAY_SEC, RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1)))
