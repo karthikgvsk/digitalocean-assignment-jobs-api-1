@@ -107,17 +107,17 @@ flowchart TB
     end
     SCRAPER[Prometheus Scraper / Metrics Consumer]
 
-    CLIENT -->|HTTP requests| API
-    API -->|read / update job state| JOBS
-    API -->|same DB transaction: insert job + outbox intent| OUTBOX
-    DISPATCH -->|poll due unpublished rows| OUTBOX
-    DISPATCH -->|XADD to priority-specific stream| VK
-    WORKER -->|XREADGROUP from streams| VK
-    WORKER -->|lock / transition job state| JOBS
-    WORKER --> HANDLERS
-    WORKER -->|XACK after state is persisted| VK
-    API -->|GET /metrics| SCRAPER
-    API -->|set drain flag| CONTROL
+    CLIENT -->|1. Submit / query / cancel| API
+    API -->|2. Read or update job state| JOBS
+    API -->|3. Atomic insert: job + outbox| OUTBOX
+    DISPATCH -->|4. Poll due unpublished records| OUTBOX
+    DISPATCH -->|5. XADD to priority stream| VK
+    WORKER -->|6. XREADGROUP: receive job| VK
+    WORKER -->|7. Lock job; set running / outcome| JOBS
+    WORKER -->|8. XACK after durable state update| VK
+    WORKER -->|9. Invoke registered task| HANDLERS
+    API -->|10. Expose /metrics| SCRAPER
+    API -->|11. Set drain control flag| CONTROL
 ```
 
 The boxes inside the data-services boundary are logical tables/streams, not separate deployed services. The `outbox` table lives in PostgreSQL, while the dispatcher is a background loop running inside the API process. The worker is a separate process/service and can be scaled independently from the API.
