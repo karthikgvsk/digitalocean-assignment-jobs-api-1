@@ -1,13 +1,14 @@
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from app.db import SessionLocal
+from app.db import Base, SessionLocal, engine
 from app.main import app
 
 client = TestClient(app)
 
 
 def setup_function() -> None:
+    Base.metadata.create_all(engine)
     with SessionLocal() as session:
         session.execute(text("TRUNCATE TABLE outbox, jobs CASCADE"))
         session.commit()
