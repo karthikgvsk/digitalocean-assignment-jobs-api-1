@@ -8,7 +8,6 @@ import signal
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from datetime import datetime, timezone
 from uuid import UUID
 
 import redis
@@ -104,9 +103,6 @@ def process(client: redis.Redis, stream: str, message_id: str, fields: dict[str,
                 else:
                     job.status = "dead_lettered"
                 session.commit()
-                terminal = job.status == "dead_lettered"
-            else:
-                terminal = True
         logger.exception("job_attempt_failed id=%s", job_id)
         # A retry has been durably written to outbox; terminal state is durable before ACK.
         client.xack(stream, GROUP, message_id)
