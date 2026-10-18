@@ -162,9 +162,48 @@ The current retry policy republishes eligible retries promptly; exponential back
 
 ### 6.6 CI and test suite
 
-GitHub Actions runs Ruff, unit tests, integration tests against disposable PostgreSQL/Redis services, and a Docker build. The integration tests cover API persistence, idempotency, priority-stream publication, successful worker execution, retries/dead-lettering, and cancellation. A passing CI run validates these checks in the test environment; it is not a load test or proof of a production SLO.
+GitHub Actions runs Ruff, unit tests, integration tests against disposable PostgreSQL/Redis services, and a Docker image build. See [Testing](#7-testing) for the test suites and scenario-level coverage.
 
-## 7. Job lifecycle
+## 7. Testing
+
+Automated tests are organized into unit tests and integration/API tests. GitHub Actions runs both on pushes to `main` and pull requests targeting `main`, then builds the Docker image. CI uses Python 3.12, PostgreSQL 16, and Redis 7 service containers; the same integration code exercises the Redis Streams behavior used by DigitalOcean Valkey.
+
+### Test commands
+
+```bash
+pytest tests/test_unit.py
+pytest tests/test_api.py tests/test_integration.py
+ruff check .
+docker build -t jobs-api:local .
+```
+
+### Unit-test coverage — `tests/test_unit.py`
+
+- **Task handlers:** `echo` returns the supplied payload; `sleep` returns its requested duration; `fail` raises the expected error; unsupported task types are rejected.
+- **Execution timeout wrapper:** successful task results are returned, handler failures propagate, and a task that exceeds its timeout is stopped and raises a timeout error.
+- **Request-model defaults:** verifies the default `normal` priority, empty payload, 3 retries, and 30-second timeout.
+- **Request validation:** rejects an empty task type, unsupported priority, zero timeout, and negative retry count.
+
+### API and integration coverage — `tests/test_api.py` and `tests/test_integration.py`
+
+- **Job submission and retrieval:** submitting a valid job returns `202 Accepted` with `queued` status, and the job can be retrieved by ID.
+- **Idempotent submission:** repeating a request with the same `Idempotency-Key` returns the same job, sets `Idempotency-Replayed: true`, and does not create duplicate job or outbox rows.
+- **Input validation over HTTP:** invalid job input returns `422 Unprocessable Entity`.
+- **Listing and status filtering:** the jobs list can filter by status and excludes jobs in other states.
+- **Cancellation rules:** queued jobs can be cancelled; cancellation of a non-queued job returns `409 Conflict`.
+- **Drain confirmation:** a drain request without explicit confirmation is rejected; a confirmed request sets the draining state.
+- **Transactional outbox and priority routing:** a submitted job is published to the correct Redis Stream for each of `high`, `normal`, and `low`; the message contains the job ID and the outbox row is marked published.
+- **Successful worker execution:** the worker consumes an `echo` message, executes the task, and persists `succeeded`, one attempt, and no error in PostgreSQL.
+- **Retry and terminal failure:** a failing task is re-queued while a retry remains, records its error and attempt count, and becomes `dead_lettered` when the configured retry limit is exhausted.
+- **Cancelled-job safety:** a cancelled job is acknowledged/skipped by the worker without executing the handler or incrementing its attempt count.
+
+Each test resets the dedicated test database tables and Redis state to isolate scenarios.
+
+### What CI verifies—and does not
+
+The workflow checks Ruff linting, runs the unit suite, runs API/integration tests against PostgreSQL and Redis, and builds the Docker image. These checks validate the listed behaviors in CI, but they do **not** currently constitute load/stress testing, chaos testing, a deployed-environment smoke test, or verification of production service-level objectives. Dedicated tests for scheduled `run_at` behavior, health/metrics endpoints, dependency failures, stale pending-message recovery, worker-crash reconciliation, and strict priority ordering are not currently included.
+
+## 8. Job lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -183,7 +222,7 @@ stateDiagram-v2
 - A terminal failure is represented as `dead_lettered` in PostgreSQL; there is no separate dead-letter Redis stream.
 - A cancelled job is skipped if its message is later consumed.
 
-## 8. API surface
+## 9. API surface
 
 | Method | Endpoint | Purpose |
 |---|---|---|
@@ -197,7 +236,7 @@ stateDiagram-v2
 | GET | `/health` | Basic process health response |
 | GET | `/metrics` | Prometheus metrics |
 
-## 9. Configuration
+## 10. Configuration
 
 | Variable | Used by | Purpose |
 |---|---|---|
@@ -208,7 +247,7 @@ stateDiagram-v2
 
 Use the provider's private networking and TLS connection details where available. Store credentials as App Platform environment variables marked secret. Do not put live credentials in this document or in source control.
 
-## 10. Scaling and operations
+## 11. Scaling and operations
 
 - Scale API instances according to request rate and latency.
 - Scale worker containers and per-container concurrency according to queue age, job duration, CPU/memory, and downstream limits.
@@ -218,7 +257,7 @@ Use the provider's private networking and TLS connection details where available
 - Use managed PostgreSQL and Valkey, TLS, private networking, and platform-managed secrets.
 - Before production use, add authentication/authorization, database migrations, pending-message reclamation and running-job recovery, retry backoff/jitter, a resume endpoint for drain mode, and load/chaos tests.
 
-## 11. Known limitations and future improvements
+## 12. Known limitations and future improvements
 
 1. **Worker crash recovery:** reclaim stale Redis pending entries and reconcile jobs left in `running`.
 2. **Retry policy:** add exponential backoff with jitter and make retry scheduling explicit.
@@ -230,7 +269,7 @@ Use the provider's private networking and TLS connection details where available
 8. **Scheduling:** add a durable scheduler for cron/recurring jobs if that becomes a requirement.
 9. **Load validation:** define measurable throughput and latency targets and validate them with load tests.
 
-## 12. Assumptions
+## 13. Assumptions
 
 - PostgreSQL is the authoritative record for job state.
 - Redis Streams/Valkey is used for dispatch and consumer coordination.
