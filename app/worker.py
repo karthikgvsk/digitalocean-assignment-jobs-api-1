@@ -7,7 +7,7 @@ import os
 import signal
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from multiprocessing import Pipe, Process
 from uuid import UUID
 
@@ -147,20 +147,40 @@ def main() -> None:
     ensure_groups(client)
     logger.info("worker_started consumer=%s concurrency=%s", CONSUMER, CONCURRENCY)
     pool = ThreadPoolExecutor(max_workers=CONCURRENCY)
+    pending = set()
     try:
         while not stopping:
+            completed = {future for future in pending if future.done()}
+            for future in completed:
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("worker_task_crashed")
+            pending.difference_update(completed)
+
             if client.get("jobs:drain") == "1":
                 time.sleep(0.5)
                 continue
+            if len(pending) >= CONCURRENCY:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                pending.difference_update(done)
+                for future in done:
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.exception("worker_task_crashed")
+                continue
+
+            capacity = CONCURRENCY - len(pending)
             records = client.xreadgroup(
                 GROUP, CONSUMER, {stream: ">" for stream in STREAMS},
-                count=CONCURRENCY, block=1000,
+                count=capacity, block=1000,
             )
             for stream, messages in records:
                 for message_id, fields in messages:
-                    if stopping or client.get("jobs:drain") == "1":
+                    if stopping or client.get("jobs:drain") == "1" or len(pending) >= CONCURRENCY:
                         break
-                    pool.submit(process, client, stream, message_id, fields)
+                    pending.add(pool.submit(process, client, stream, message_id, fields))
     finally:
         # Let already-claimed jobs finish before the process exits on SIGTERM.
         pool.shutdown(wait=True, cancel_futures=False)
