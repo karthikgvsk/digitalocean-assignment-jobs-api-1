@@ -58,7 +58,6 @@ def create_job(
                 idempotency_key=idempotency_key,
             )
             session.add(job)
-            session.flush()
             session.add(
                 Outbox(
                     job_id=job.id,
@@ -149,10 +148,17 @@ def queue_depth() -> dict[str, int]:
 
 
 def retry_job(job_id: UUID) -> tuple[Job | None, bool]:
+    # A stable outbox ID makes retrying an uncertain COMMIT safe for this operation.
+    retry_outbox_id = uuid4()
+
     def operation() -> tuple[Job | None, bool]:
         with SessionLocal() as session:
             job = session.scalar(select(Job).where(Job.id == job_id).with_for_update())
-            if not job or job.status not in ("failed", "dead_lettered"):
+            if not job:
+                return None, False
+            if job.status == "queued" and session.get(Outbox, retry_outbox_id):
+                return job, True
+            if job.status not in ("failed", "dead_lettered"):
                 return job, False
             job.status, job.attempts, job.error, job.updated_at = (
                 "queued",
@@ -162,6 +168,7 @@ def retry_job(job_id: UUID) -> tuple[Job | None, bool]:
             )
             session.add(
                 Outbox(
+                    id=retry_outbox_id,
                     job_id=job.id,
                     stream=STREAMS[job.priority],
                     payload={
