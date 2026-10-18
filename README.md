@@ -3,8 +3,8 @@
 FastAPI service for asynchronous job submission, backed by PostgreSQL and Redis Streams.
 
 ## Architecture
-- API validates requests and persists jobs.
-- Transactional outbox records enqueue intent in the same database transaction as the job; a dispatcher publishes it to Redis Streams.
+- API validates requests and persists jobs plus outbox records in one PostgreSQL transaction.
+- A dedicated dispatcher component polls the outbox and publishes due jobs to Redis Streams.
 - Worker replicas consume via consumer groups and update job state in PostgreSQL.
 - Delivery is at-least-once: handlers must be idempotent. Dead-letter state is persisted before acknowledging the stream message.
 - `max_retries` means retries after the initial attempt. One-time `run_at` scheduling is in scope; cron can be added later.
@@ -50,4 +50,4 @@ GitHub Actions runs unit tests and integration tests in separate steps with
 dedicated PostgreSQL and Redis service containers.
 
 ## Production/scaling notes
-Scale API and workers independently. Increase worker concurrency gradually while watching queue lag, DB connections, retries, and execution latency. Use managed PostgreSQL/Redis, private networking, TLS, and platform-managed secrets. Alert on oldest pending-job age, dead-letter rate, outbox lag, and worker health. Never commit credentials.
+Scale API, dispatcher, and workers independently. Docker Compose runs the dispatcher as its own service using `python -m app.dispatcher`. Increase worker concurrency gradually while watching queue lag, DB connections, retries, and execution latency. Use managed PostgreSQL/Redis, private networking, TLS, and platform-managed secrets. Alert on oldest pending-job age, dead-letter rate, outbox lag, and worker health. Never commit credentials.
