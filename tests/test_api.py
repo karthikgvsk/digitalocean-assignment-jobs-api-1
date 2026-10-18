@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from uuid import UUID
 from sqlalchemy import func, select, text
 import redis
 
@@ -59,7 +60,7 @@ def test_cannot_cancel_non_queued_job() -> None:
     job = client.post("/jobs", json={"task_type": "echo"}).json()
     # The test database is isolated, so transition the record to running directly.
     with SessionLocal() as session:
-        stored_job = session.get(Job, job["id"])
+        stored_job = session.get(Job, UUID(job["id"]))
         stored_job.status = "running"
         session.commit()
 
