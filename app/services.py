@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
 from uuid import UUID
 
 import redis
@@ -32,14 +31,23 @@ class QueueUnavailableError(Exception):
     pass
 
 
-def submit_job(request: Any, idempotency_key: str | None):
+def submit_job(
+    *,
+    task_type: str,
+    payload: dict,
+    priority: str,
+    max_retries: int,
+    timeout_sec: int,
+    run_at,
+    idempotency_key: str | None,
+):
     job, replayed = repositories.create_job(
-        task_type=request.task_type,
-        payload=request.payload,
-        priority=request.priority.value,
-        max_retries=request.max_retries,
-        timeout_sec=request.timeout_sec,
-        run_at=request.run_at,
+        task_type=task_type,
+        payload=payload,
+        priority=priority,
+        max_retries=max_retries,
+        timeout_sec=timeout_sec,
+        run_at=run_at,
         idempotency_key=idempotency_key,
     )
     if not replayed:
