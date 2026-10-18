@@ -121,7 +121,7 @@ def process(client: redis.Redis, stream: str, message_id: str, fields: dict[str,
         client.xack(stream, GROUP, message_id)
     except (Exception, TimeoutError) as exc:
         with SessionLocal() as session:
-            job = session.get(Job, job_id)
+            job = session.get(Job, parsed_job_id)
             if job:
                 job.error = str(exc)[:4000]
                 job.updated_at = utcnow()
