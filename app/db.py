@@ -8,7 +8,22 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://jobs:jobs@localhost:5432/jobs")
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
+DB_CONNECT_TIMEOUT_SEC = max(1, int(os.getenv("DB_CONNECT_TIMEOUT_SEC", "5")))
+DB_POOL_TIMEOUT_SEC = max(1, int(os.getenv("DB_POOL_TIMEOUT_SEC", "5")))
+DB_STATEMENT_TIMEOUT_MS = max(100, int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000")))
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=DB_POOL_TIMEOUT_SEC,
+    pool_recycle=1800,
+    connect_args={
+        "connect_timeout": DB_CONNECT_TIMEOUT_SEC,
+        "options": f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
+    },
+)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
