@@ -5,15 +5,15 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 import redis
 from fastapi import FastAPI, Header, HTTPException, Query, Response, status
-from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 
 from app.db import Base, Job, Outbox, SessionLocal, engine, utcnow
@@ -185,8 +185,8 @@ def submit_job(
 
 @app.get("/jobs", response_model=list[JobView])
 def list_jobs(
-    job_status: JobStatus | None = Query(default=None, alias="status"),
-    limit: int = Query(default=100, ge=1, le=500),
+    job_status: Annotated[JobStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> list[JobView]:
     with SessionLocal() as session:
         query = select(Job).order_by(Job.created_at.desc()).limit(limit)
