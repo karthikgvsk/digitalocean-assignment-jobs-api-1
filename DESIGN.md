@@ -1,0 +1,238 @@
+# Design: Asynchronous Jobs API
+
+## 1. Overview
+
+This service accepts work over HTTP, persists job state in PostgreSQL, publishes dispatch intent through a transactional outbox to Redis Streams (DigitalOcean Valkey in the deployed environment), and executes jobs in a separate worker process. The API and worker share a repository and Docker image but run as separate DigitalOcean App Platform components so they can be scaled and configured independently.
+
+**Design principle:** PostgreSQL is the source of truth for job lifecycle state. Redis Streams is the delivery/dispatch mechanism, not the authoritative job record.
+
+## 2. Goals and scope
+
+### In scope
+
+- Submit asynchronous jobs and return quickly with `202 Accepted`.
+- Inspect a job by ID and list recent jobs, optionally filtered by status.
+- Support high, normal, and low priority queues.
+- Persist job state and enqueue intent atomically.
+- Execute jobs in a separate worker with configurable concurrency and per-attempt timeouts.
+- Retry failed attempts up to a configured limit and persist terminal dead-letter state.
+- Support idempotency keys for duplicate submission requests.
+- Support one-time scheduled execution with `run_at`.
+- Cancel jobs that are still queued, manually retry failed/dead-lettered jobs, and expose queue-depth and Prometheus metrics.
+- Run automated unit and integration tests in GitHub Actions.
+
+### Out of scope / deferred
+
+- Cron/recurring schedules.
+- A separate Redis dead-letter stream; terminal dead-letter state is stored in PostgreSQL.
+- A full administrative UI, authentication/authorization policy, tenant isolation, and per-customer quotas.
+- Strict global priority ordering across all priority classes.
+- Exactly-once execution of arbitrary task side effects.
+
+## 3. Functional requirements
+
+| ID | Requirement | Current behavior |
+|---|---|---|
+| FR-1 | Submit a job | `POST /jobs` validates input, stores a job and outbox record, and returns `202 Accepted`. |
+| FR-2 | Read a job | `GET /jobs/{job_id}` returns persisted lifecycle details or `404`. |
+| FR-3 | List jobs | `GET /jobs?status=queued&limit=100` lists recent jobs, optionally filtered by status. |
+| FR-4 | Prioritize jobs | `high`, `normal`, and `low` map to `jobs:high`, `jobs:normal`, and `jobs:low` Redis Streams. |
+| FR-5 | Execute asynchronously | Worker consumer groups read stream messages and execute registered task handlers. |
+| FR-6 | Bound execution time | Each attempt runs in a child process and is terminated if it exceeds `timeout_sec`. |
+| FR-7 | Retry failures | A failed attempt is returned to `queued` while retries remain; otherwise it becomes `dead_lettered`. `max_retries` counts retries after the initial attempt. |
+| FR-8 | Avoid duplicate submissions | `Idempotency-Key` returns the existing job for a repeated key and sets `Idempotency-Replayed: true`. |
+| FR-9 | Cancel queued jobs | `DELETE /jobs/{job_id}` cancels only queued jobs; other states return `409`. |
+| FR-10 | Manually retry terminal jobs | `POST /jobs/{job_id}/retry` resets a failed/dead-lettered job and creates a new outbox record. |
+| FR-11 | Schedule a one-time job | A future `run_at` keeps its outbox record unpublished until its scheduled time. |
+| FR-12 | Inspect queue depth | `GET /queue/depth` returns counts of queued PostgreSQL jobs by priority. These are DB state counts, not exact Redis stream lengths. |
+| FR-13 | Drain/pause consumption | `POST /queue/drain` requires `{"confirm": true}` and sets a Redis flag that tells workers to stop claiming new jobs. A resume endpoint is not currently implemented. |
+| FR-14 | Health and metrics | `GET /health` returns a basic health response; `GET /metrics` exposes Prometheus metrics. |
+
+### Job request fields
+
+- `task_type`: required handler name, 1–100 characters.
+- `payload`: JSON object, defaults to an empty object.
+- `priority`: `high`, `normal`, or `low`; defaults to `normal`.
+- `max_retries`: 0–20; defaults to 3 retries after the first attempt.
+- `timeout_sec`: 1–3600 seconds; defaults to 30 seconds per attempt.
+- `run_at`: optional timestamp for one-time scheduling.
+
+The current worker includes sample `echo`, `sleep`, and `fail` handlers. New task types must be explicitly registered/implemented in the worker.
+
+## 4. Non-functional requirements
+
+These are design goals; numeric service-level objectives have not yet been benchmarked.
+
+| ID | Requirement | Approach / qualification |
+|---|---|---|
+| NFR-1 | Durability | Job and outbox intent commit together in PostgreSQL. |
+| NFR-2 | Delivery reliability | Outbox dispatcher publishes to Redis Streams; consumer groups coordinate delivery. Delivery is at-least-once, not exactly-once. |
+| NFR-3 | Duplicate tolerance | Idempotency keys protect repeated API submissions. Task handlers should also be idempotent because a worker may repeat side effects after failures. |
+| NFR-4 | Fault isolation | API and worker are separate App Platform components; a worker failure need not make HTTP submission unavailable if dependencies remain healthy. |
+| NFR-5 | Horizontal scalability | API instances and worker containers can be scaled separately. Worker concurrency is controlled by `WORKER_CONCURRENCY`. |
+| NFR-6 | Bounded resource use | Worker concurrency is bounded; each task attempt has a timeout. Memory/CPU limits and database connection pools must be sized with concurrency. |
+| NFR-7 | Observability | Application logs plus Prometheus counters/gauges expose submissions, cancellations, and pending outbox count. |
+| NFR-8 | Maintainability | FastAPI, SQLAlchemy, Pydantic, Redis Streams, Docker, and pytest are used with explicit API and worker entry points. |
+| NFR-9 | Security | Use TLS for managed database/cache connections, platform-managed environment variables/secrets, restricted network access, and never commit credentials. Authentication and authorization still need to be added for a public production API. |
+| NFR-10 | Testability | Unit tests cover handlers/validation; integration tests use disposable PostgreSQL and Redis service containers in CI. |
+
+## 5. Architecture
+
+### Component diagram
+
+```mermaid
+flowchart LR
+    Client[API Client] -->|HTTPS / REST| API[FastAPI Web Service]
+    API -->|read/write jobs and outbox| PG[(PostgreSQL)]
+    API -->|background dispatcher| OUTBOX[Transactional Outbox]
+    OUTBOX -->|XADD| VALKEY[(Redis Streams / Valkey)]
+    VALKEY -->|consumer group reads| WORKER[Background Worker]
+    WORKER -->|claim/update job state| PG
+    WORKER --> HANDLERS[Task Handler Registry]
+    API -->|/metrics| METRICS[Prometheus Scraper]
+```
+
+The outbox is a table in PostgreSQL, not a separate service. The API process runs a periodic dispatcher loop that publishes eligible outbox rows to Redis Streams.
+
+### Deployment view
+
+```mermaid
+flowchart TB
+    GH[GitHub Repository: main] --> CI[GitHub Actions: lint, tests, Docker build]
+    GH --> APIAPP[DigitalOcean App Platform: Web Service]
+    GH --> WORKERAPP[DigitalOcean App Platform: Worker]
+    APIAPP --> PG[(Managed PostgreSQL)]
+    APIAPP --> VK[(Managed Valkey)]
+    WORKERAPP --> PG
+    WORKERAPP --> VK
+```
+
+The API and worker use the same repository and Dockerfile but different start commands:
+- API: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+- Worker: `python -m app.worker`
+
+## 6. Component responsibilities
+
+### 6.1 API service — `app/main.py`
+
+- Validates requests using Pydantic models.
+- Implements REST endpoints and maps database records to response models.
+- Stores each new job and its outbox record in one PostgreSQL transaction.
+- Runs a periodic outbox publishing loop as part of the API lifespan.
+- Exposes health and Prometheus endpoints.
+- Sets a Redis control flag for the drain/pause operation.
+
+The health endpoint currently reports process health only; it does not actively verify PostgreSQL and Valkey connectivity.
+
+### 6.2 PostgreSQL — `app/db.py`
+
+- Stores the canonical `jobs` lifecycle record: ID, type, payload, priority, status, attempt count, retry limit, timeout, schedule, timestamps, error, and idempotency key.
+- Stores `outbox` records that represent intent to enqueue a job.
+- Uses SQLAlchemy and a PostgreSQL UUID/JSONB schema.
+- Uses `create_all` at startup for this assignment; a production migration tool and versioned migrations should replace this approach.
+
+### 6.3 Transactional outbox dispatcher
+
+- Selects unpublished outbox rows whose scheduled time is due.
+- Locks rows using `FOR UPDATE SKIP LOCKED`, publishes to the appropriate Redis Stream, and records `published_at`.
+- Runs periodically, allowing an unpublished row to be retried on a later pass after a transient error.
+
+There is a small dual-write window: Redis may accept `XADD` before the database transaction records `published_at`. If the database commit then fails, the row can be published again. This is why consumers and task side effects must tolerate duplicates.
+
+### 6.4 Valkey / Redis Streams
+
+- Provides three streams: `jobs:high`, `jobs:normal`, and `jobs:low`.
+- Uses the `job-workers` consumer group to coordinate consumers.
+- Carries the job ID and serialized task information needed for dispatch.
+- Stores the `jobs:drain` control flag.
+
+The worker reads the streams together. The current implementation does not promise strict global priority ordering. Redis stream pending-message recovery/reclaim after a consumer crash is not yet implemented; a message left pending can require operational recovery.
+
+### 6.5 Worker — `app/worker.py`
+
+- Creates consumer groups if they do not exist.
+- Claims new messages from the priority streams.
+- Loads and locks the PostgreSQL job record, skipping jobs that are no longer queued or already terminal.
+- Marks the job `running`, increments `attempts`, and executes the task in a child process.
+- Marks success or persists the error and either schedules another attempt through the outbox or marks the job `dead_lettered`.
+- Acknowledges a stream message after persisting the resulting state.
+- Handles SIGTERM/SIGINT by stopping new claims and waiting for in-flight thread-pool tasks to finish.
+
+The current retry policy republishes eligible retries promptly; exponential backoff and jitter are not implemented. A crash after marking a job `running` also needs a recovery/reconciliation mechanism to prevent a job remaining in that state indefinitely.
+
+### 6.6 CI and test suite
+
+GitHub Actions runs Ruff, unit tests, integration tests against disposable PostgreSQL/Redis services, and a Docker build. The integration tests cover API persistence, idempotency, priority-stream publication, successful worker execution, retries/dead-lettering, and cancellation. A passing CI run validates these checks in the test environment; it is not a load test or proof of a production SLO.
+
+## 7. Job lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: Submit / retry
+    queued --> running: Worker claims job
+    running --> succeeded: Handler succeeds
+    running --> queued: Failure and retries remain
+    running --> dead_lettered: Retry limit exhausted
+    queued --> cancelled: Client cancellation
+    failed --> queued: Manual retry
+    dead_lettered --> queued: Manual retry
+```
+
+- `attempts` increments when a worker begins an execution attempt.
+- With `max_retries = N`, the job may execute up to `N + 1` times in total.
+- A terminal failure is represented as `dead_lettered` in PostgreSQL; there is no separate dead-letter Redis stream.
+- A cancelled job is skipped if its message is later consumed.
+
+## 8. API surface
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/jobs` | Submit a job; optional `Idempotency-Key` header |
+| GET | `/jobs/{job_id}` | Get a job and its state |
+| GET | `/jobs?status=queued&limit=100` | List jobs with optional status and limit |
+| DELETE | `/jobs/{job_id}` | Cancel a queued job |
+| POST | `/jobs/{job_id}/retry` | Manually retry a failed/dead-lettered job |
+| GET | `/queue/depth` | Queued-job counts grouped by priority |
+| POST | `/queue/drain` | Pause workers from claiming new jobs (requires confirmation) |
+| GET | `/health` | Basic process health response |
+| GET | `/metrics` | Prometheus metrics |
+
+## 9. Configuration
+
+| Variable | Used by | Purpose |
+|---|---|---|
+| `DATABASE_URL` | API and worker | PostgreSQL connection URL |
+| `REDIS_URL` | API and worker | Redis/Valkey connection URL, including TLS options |
+| `WORKER_CONCURRENCY` | Worker | Maximum number of concurrent job-processing tasks in one worker process; defaults to 4 |
+| `LOG_LEVEL` | API and worker | Logging level; defaults to `INFO` |
+
+Use the provider's private networking and TLS connection details where available. Store credentials as App Platform environment variables marked secret. Do not put live credentials in this document or in source control.
+
+## 10. Scaling and operations
+
+- Scale API instances according to request rate and latency.
+- Scale worker containers and per-container concurrency according to queue age, job duration, CPU/memory, and downstream limits.
+- Keep PostgreSQL connection-pool limits in mind when increasing worker count; each process has its own pool.
+- Monitor submission rate, oldest queued-job age, pending outbox count, retries, dead-letter rate, task latency, worker restarts, and database connection pressure.
+- Set alerts for sustained queue growth, increasing outbox lag, dead-letter spikes, and unhealthy workers.
+- Use managed PostgreSQL and Valkey, TLS, private networking, and platform-managed secrets.
+- Before production use, add authentication/authorization, database migrations, pending-message reclamation and running-job recovery, retry backoff/jitter, a resume endpoint for drain mode, and load/chaos tests.
+
+## 11. Known limitations and future improvements
+
+1. **Worker crash recovery:** reclaim stale Redis pending entries and reconcile jobs left in `running`.
+2. **Retry policy:** add exponential backoff with jitter and make retry scheduling explicit.
+3. **Drain semantics:** add a safe resume endpoint and clarify whether drain means pause consumption or wait for in-flight work to finish.
+4. **Priority guarantees:** if strict priority is required, explicitly schedule/claim from streams in priority order rather than reading them together.
+5. **Schema management:** introduce versioned migrations instead of startup `create_all`.
+6. **Observability:** add structured JSON logs, queue-age/job-duration/retry metrics, and dependency-aware readiness checks.
+7. **Security:** protect job-management and operational endpoints with authentication and authorization before exposing them to untrusted clients.
+8. **Scheduling:** add a durable scheduler for cron/recurring jobs if that becomes a requirement.
+9. **Load validation:** define measurable throughput and latency targets and validate them with load tests.
+
+## 12. Assumptions
+
+- PostgreSQL is the authoritative record for job state.
+- Redis Streams/Valkey is used for dispatch and consumer coordination.
+- The service provides at-least-once dispatch semantics; exactly-once arbitrary side effects are not guaranteed.
+- The initial target is a small assignment deployment on DigitalOcean App Platform, with API and worker components independently deployed from one repository.
