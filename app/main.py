@@ -11,7 +11,7 @@ from uuid import UUID
 
 import redis
 from fastapi import FastAPI, Header, HTTPException, Query, Response, status
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
@@ -21,7 +21,6 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 JOBS_SUBMITTED = Counter("jobs_submitted_total", "Number of accepted job submissions")
 JOBS_CANCELLED = Counter("jobs_cancelled_total", "Number of cancelled jobs")
-OUTBOX_PENDING = Gauge("outbox_pending_records", "Unpublished transactional outbox records")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 STREAMS = {"high": "jobs:high", "normal": "jobs:normal", "low": "jobs:low"}
 
