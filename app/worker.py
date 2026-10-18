@@ -7,7 +7,8 @@ import os
 import signal
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Pipe, Process
 from uuid import UUID
 
 import redis
@@ -41,6 +42,39 @@ def execute_task(task_type: str, payload: dict) -> dict:
     if task_type == "fail":
         raise RuntimeError(str(payload.get("message", "Requested test failure")))
     raise ValueError(f"Unsupported task_type: {task_type}")
+
+
+def _run_in_child(connection: object, task_type: str, payload: dict) -> None:
+    try:
+        connection.send((True, execute_task(task_type, payload)))
+    except BaseException as exc:
+        connection.send((False, f"{type(exc).__name__}: {exc}"))
+    finally:
+        connection.close()
+
+
+def execute_with_timeout(task_type: str, payload: dict, timeout_sec: int) -> dict:
+    parent, child = Pipe(duplex=False)
+    process = Process(target=_run_in_child, args=(child, task_type, payload), daemon=True)
+    process.start()
+    child.close()
+    process.join(timeout=timeout_sec)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        parent.close()
+        raise TimeoutError(f"Task exceeded timeout of {timeout_sec} seconds")
+    if parent.poll():
+        succeeded, value = parent.recv()
+        parent.close()
+        if succeeded:
+            return value
+        raise RuntimeError(value)
+    parent.close()
+    raise RuntimeError(f"Task process exited unexpectedly (exit code {process.exitcode})")
 
 
 def ensure_groups(client: redis.Redis) -> None:
@@ -77,13 +111,7 @@ def process(client: redis.Redis, stream: str, message_id: str, fields: dict[str,
         task_type, payload, timeout_sec = job.task_type, job.payload, job.timeout_sec
 
     try:
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(execute_task, task_type, payload)
-        try:
-            result = future.result(timeout=timeout_sec)
-        finally:
-            # Do not block the worker loop waiting for a timed-out task.
-            pool.shutdown(wait=False, cancel_futures=True)
+        result = execute_with_timeout(task_type, payload, timeout_sec)
         with SessionLocal() as session:
             job = session.get(Job, parsed_job_id)
             if job:
