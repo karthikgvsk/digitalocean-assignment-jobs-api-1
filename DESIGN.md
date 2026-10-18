@@ -369,7 +369,60 @@ Use the provider's private networking and TLS connection details where available
 - Use managed PostgreSQL and Valkey, TLS, private networking, and platform-managed secrets.
 - Before production use, add authentication/authorization, database migrations, pending-message reclamation and running-job recovery, retry backoff/jitter, a resume endpoint for drain mode, and load/chaos tests.
 
-## 12. Known limitations and future improvements
+
+## 12. FAQ: design choices and scaling
+
+### Why use PostgreSQL as the source of truth instead of Redis?
+
+PostgreSQL stores durable job state, attempts, scheduling information, errors, idempotency keys, and outbox records. It supports transactional updates and row locking, which are important when API requests, dispatchers, and workers race to change a job. Redis Streams is used for efficient dispatch and consumer coordination, not as the authoritative job database.
+
+### Why use a transactional outbox?
+
+Creating a job in PostgreSQL and publishing directly to Redis would create a dual-write failure window: the database write could succeed while the Redis publish fails, or vice versa. The API therefore commits the job and its outbox row together. A dispatcher publishes outbox records asynchronously and marks them published. This makes enqueue intent durable, although publishing and marking the row published are still not atomic across PostgreSQL and Redis, so duplicate messages remain possible.
+
+### Why separate the API and worker into different App Platform components?
+
+The API handles short-lived HTTP requests, while workers run tasks that may take seconds or minutes. Separating them allows each tier to be deployed, restarted, resourced, and scaled independently. A rise in task duration can be handled by adding worker capacity without automatically adding API instances. Both use the same Docker image with different start commands.
+
+### Why use Redis Streams and consumer groups?
+
+Streams provide durable queue-like messages and consumer groups distribute messages among worker consumers while tracking acknowledgements and pending entries. Separate streams make priority classes explicit and allow queue depth and traffic to be examined by class. The current worker reads the streams together, however, so this is **priority classification, not a strict global priority guarantee**.
+
+### Why use a child process and a per-attempt timeout?
+
+Running a handler in a child process lets the worker terminate an attempt that exceeds `timeout_sec`, rather than relying only on cooperative cancellation inside the handler. It also isolates some handler failures from the long-running worker process. It does not sandbox untrusted code, and it cannot undo external side effects already performed by a timed-out handler.
+
+### Why is delivery at-least-once rather than exactly-once?
+
+A worker can crash after performing an external side effect but before durably recording success and acknowledging the message. The task may then be retried. The outbox can also publish a duplicate if Redis accepts a message but the PostgreSQL publication marker does not commit. Exactly-once behavior for arbitrary external side effects cannot be guaranteed by these components alone; handlers should use idempotency keys or deduplicate side effects at the system they call.
+
+### How does each component scale under load?
+
+- **API tier:** add App Platform API instances for higher HTTP request volume. Keep request handlers short and let PostgreSQL commit be the acceptance boundary. The API process currently also hosts an outbox polling loop, so additional API replicas add dispatcher loops as well; row locking with `FOR UPDATE SKIP LOCKED` coordinates concurrent dispatchers. Watch request latency, database pool usage, and outbox lag.
+- **Outbox dispatcher:** it currently polls about once per second inside each API process. For a larger workload, measure poll duration and outbox age, tune batch sizes and polling cadence, and consider moving dispatch into a dedicated service so it can be scaled independently. Avoid unbounded batches that hold database locks for too long.
+- **Worker tier:** add worker containers to increase parallel processing capacity. Each worker defaults to `WORKER_CONCURRENCY=4`, so approximate total in-flight capacity is worker replicas multiplied by concurrency, subject to CPU, memory, handler duration, database connections, and downstream service limits. Increase concurrency gradually and measure throughput and queue age rather than assuming linear scaling.
+- **PostgreSQL:** this is likely to become a shared bottleneck because API submissions, dispatcher polling, and worker state transitions all use it. Monitor CPU, I/O, lock waits, query latency, connection count, and pool saturation. Add appropriate indexes, bound per-process connection pools, tune queries/batches, and scale the managed database when measurements justify it.
+- **Valkey / Redis Streams:** streams buffer dispatch work between producers and consumers. Monitor stream growth, pending entries, publish errors, and consumer lag. More workers help only if worker execution is the bottleneck; they will not fix database saturation or a rate-limited downstream dependency. Add pending-message reclaim and worker-crash recovery before relying on the queue for production workloads.
+- **Task handlers and downstream systems:** slow or resource-heavy handlers can dominate throughput. Bound concurrency per handler or downstream dependency, set timeouts, use idempotent operations, and introduce retry backoff with jitter to avoid retry storms.
+
+### What happens if incoming traffic exceeds processing capacity?
+
+The queue should absorb temporary bursts, but the oldest queued-job age and queue depth will grow if arrival rate stays above completion rate. Alert on sustained growth, outbox lag, retries, dead-letter rate, and resource saturation. Apply admission controls or quotas, bound payload sizes and connection pools, and scale the actual bottleneck. The current implementation does not enforce per-tenant quotas or a formal queue-capacity limit, and `GET /queue/depth` reports queued PostgreSQL jobs by priority rather than exact Redis stream lengths.
+
+### Does the current implementation meet a specific throughput or latency target?
+
+Not yet proven. CI validates linting, unit/integration behavior, and the Docker build; it is not a load test. Throughput, p95/p99 latency, queue-drain time, and worker capacity need to be measured with representative payloads and task durations before claiming an SLO such as p99 below 50 ms or more than 1,000 jobs per minute per worker.
+
+### What would be the first production-hardening priorities?
+
+1. Recover stale Redis pending messages and reconcile jobs stranded in `running` after a worker crash.
+2. Add retry backoff with jitter and make handlers idempotent.
+3. Persist task results if clients need to retrieve them.
+4. Add dependency-aware readiness checks, structured logs, and queue-age/task-duration metrics.
+5. Add authentication/authorization, versioned database migrations, load tests, and explicit admission limits.
+6. Clarify drain/resume semantics and implement a resume endpoint.
+
+## 13. Known limitations and future improvements
 
 1. **Worker crash recovery:** reclaim stale Redis pending entries and reconcile jobs left in `running`.
 2. **Retry policy:** add exponential backoff with jitter and make retry scheduling explicit.
@@ -381,7 +434,7 @@ Use the provider's private networking and TLS connection details where available
 8. **Scheduling:** add a durable scheduler for cron/recurring jobs if that becomes a requirement.
 9. **Load validation:** define measurable throughput and latency targets and validate them with load tests.
 
-## 13. Assumptions
+## 14. Assumptions
 
 - PostgreSQL is the authoritative record for job state.
 - Redis Streams/Valkey is used for dispatch and consumer coordination.
