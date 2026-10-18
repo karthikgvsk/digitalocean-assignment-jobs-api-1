@@ -14,11 +14,11 @@ from app.activities.jobs import (
     JobStatus,
     JobView,
     Priority,
-    router as jobs_router,
 )
+from app.activities.jobs import router as jobs_router
 from app.db import Base, engine
 
-__all__ = ["DrainRequest", "JobCreate", "JobStatus", "JobView", "Priority", "REDIS_URL", "app"]
+__all__ = ["REDIS_URL", "DrainRequest", "JobCreate", "JobStatus", "JobView", "Priority", "app"]
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
