@@ -14,7 +14,7 @@ import redis
 from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from app.db import Base, Job, Outbox, SessionLocal, engine, utcnow
 
@@ -77,14 +77,22 @@ def publish_outbox_once() -> int:
     try:
         with SessionLocal() as session:
             rows = session.scalars(
-                select(Outbox).where(Outbox.published_at.is_(None)).order_by(Outbox.created_at).limit(100)
+                select(Outbox)
+                .join(Job, Job.id == Outbox.job_id)
+                .where(
+                    Outbox.published_at.is_(None),
+                    or_(Job.run_at.is_(None), Job.run_at <= utcnow()),
+                )
+                .order_by(Outbox.created_at)
+                .limit(100)
+                .with_for_update(skip_locked=True)
             ).all()
             for row in rows:
                 client.xadd(row.stream, {"job_id": str(row.job_id), "payload": __import__("json").dumps(row.payload)})
                 row.published_at = utcnow()
                 published += 1
             session.commit()
-            OUTBOX_PENDING.set(session.scalar(select(__import__("sqlalchemy").func.count()).select_from(Outbox).where(Outbox.published_at.is_(None))) or 0)
+            OUTBOX_PENDING.set(session.scalar(select(func.count()).select_from(Outbox).where(Outbox.published_at.is_(None))) or 0)
     finally:
         client.close()
     return published
@@ -228,7 +236,14 @@ def queue_depth() -> dict[str, int]:
 def drain_queue(request: DrainRequest) -> dict[str, Any]:
     if not request.confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to acknowledge queue drain")
-    raise HTTPException(status_code=501, detail="Persistent global drain coordination is not implemented yet")
+    try:
+        client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        client.set("jobs:drain", "1")
+        client.close()
+    except redis.RedisError as exc:
+        logger.exception("queue_drain_failed")
+        raise HTTPException(status_code=503, detail="Queue control store unavailable") from exc
+    return {"accepted": True, "state": "draining", "message": "Workers will stop claiming new jobs"}
 
 
 @app.post("/jobs/{job_id}/retry", response_model=JobView)
