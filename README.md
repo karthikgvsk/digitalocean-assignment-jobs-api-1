@@ -25,11 +25,29 @@ API docs: http://localhost:8000/docs · Health: http://localhost:8000/health · 
 - `POST /queue/drain` — requires `{"confirm": true}`
 
 ## Tests
+
+Unit tests exercise task handlers, timeout behavior, and request validation without
+requiring live database or queue services. Integration tests exercise the API against
+PostgreSQL and Redis/Valkey, including outbox publication, priority streams, worker
+execution, retries/dead-lettering, idempotency, and cancellation.
+
+Run unit tests:
 ```bash
 pip install -e '.[dev]'
-pytest
+pytest tests/test_unit.py
 ruff check .
 ```
+
+Run integration tests with PostgreSQL and Redis available (for example, start the
+`postgres` and `redis` services from Docker Compose, then set the URLs):
+```bash
+DATABASE_URL=postgresql+psycopg://jobs:jobs@localhost:5432/jobs \
+REDIS_URL=redis://localhost:6379/0 \
+pytest tests/test_api.py tests/test_integration.py
+```
+
+GitHub Actions runs unit tests and integration tests in separate steps with
+dedicated PostgreSQL and Redis service containers.
 
 ## Production/scaling notes
 Scale API and workers independently. Increase worker concurrency gradually while watching queue lag, DB connections, retries, and execution latency. Use managed PostgreSQL/Redis, private networking, TLS, and platform-managed secrets. Alert on oldest pending-job age, dead-letter rate, outbox lag, and worker health. Never commit credentials.
