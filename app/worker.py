@@ -77,11 +77,15 @@ def process(client: redis.Redis, stream: str, message_id: str, fields: dict[str,
         task_type, payload, timeout_sec = job.task_type, job.payload, job.timeout_sec
 
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(execute_task, task_type, payload)
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(execute_task, task_type, payload)
+        try:
             result = future.result(timeout=timeout_sec)
+        finally:
+            # Do not block the worker loop waiting for a timed-out task.
+            pool.shutdown(wait=False, cancel_futures=True)
         with SessionLocal() as session:
-            job = session.get(Job, job_id)
+            job = session.get(Job, parsed_job_id)
             if job:
                 job.status, job.error, job.updated_at = "succeeded", None, utcnow()
                 session.commit()
@@ -114,19 +118,25 @@ def main() -> None:
     client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     ensure_groups(client)
     logger.info("worker_started consumer=%s concurrency=%s", CONSUMER, CONCURRENCY)
-    while not stopping:
-        if client.get("jobs:drain") == "1":
-            time.sleep(0.5)
-            continue
-        records = client.xreadgroup(GROUP, CONSUMER, {stream: ">" for stream in STREAMS}, count=CONCURRENCY, block=1000)
-        for stream, messages in records:
-            for message_id, fields in messages:
-                if stopping:
-                    break
-                if client.get("jobs:drain") == "1":
-                    break
-                process(client, stream, message_id, fields)
-    client.close()
+    pool = ThreadPoolExecutor(max_workers=CONCURRENCY)
+    try:
+        while not stopping:
+            if client.get("jobs:drain") == "1":
+                time.sleep(0.5)
+                continue
+            records = client.xreadgroup(
+                GROUP, CONSUMER, {stream: ">" for stream in STREAMS},
+                count=CONCURRENCY, block=1000,
+            )
+            for stream, messages in records:
+                for message_id, fields in messages:
+                    if stopping or client.get("jobs:drain") == "1":
+                        break
+                    pool.submit(process, client, stream, message_id, fields)
+    finally:
+        # Let already-claimed jobs finish before the process exits on SIGTERM.
+        pool.shutdown(wait=True, cancel_futures=False)
+        client.close()
     logger.info("worker_stopped")
 
 
