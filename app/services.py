@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 import redis
@@ -38,7 +40,7 @@ def submit_job(
     priority: str,
     max_retries: int,
     timeout_sec: int,
-    run_at,
+    run_at: datetime | None,
     idempotency_key: str | None,
 ):
     job, replayed = repositories.create_job(
