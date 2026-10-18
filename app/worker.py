@@ -15,6 +15,7 @@ import redis
 from sqlalchemy import select
 
 from app.db import Job, Outbox, SessionLocal, utcnow
+from app.resilience import create_redis_client
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ def process(client: redis.Redis, stream: str, message_id: str, fields: dict[str,
 def main() -> None:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    client = create_redis_client(REDIS_URL)
     ensure_groups(client)
     logger.info("worker_started consumer=%s concurrency=%s", CONSUMER, CONCURRENCY)
     pool = ThreadPoolExecutor(max_workers=CONCURRENCY)
