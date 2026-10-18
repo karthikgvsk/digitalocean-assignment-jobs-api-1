@@ -47,7 +47,7 @@ def execute_task(task_type: str, payload: dict) -> dict:
 def _run_in_child(connection: object, task_type: str, payload: dict) -> None:
     try:
         connection.send((True, execute_task(task_type, payload)))
-    except BaseException as exc:
+    except Exception as exc:
         connection.send((False, f"{type(exc).__name__}: {exc}"))
     finally:
         connection.close()
