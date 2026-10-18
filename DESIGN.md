@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This service accepts work over HTTP, persists job state in PostgreSQL, publishes dispatch intent through a transactional outbox to Redis Streams (DigitalOcean Valkey in the deployed environment), and executes jobs in a separate worker process. The API and worker share a repository and Docker image but run as separate DigitalOcean App Platform components so they can be scaled and configured independently.
+This service accepts work over HTTP, persists job state and dispatch intent in PostgreSQL, publishes due outbox records to Redis Streams (DigitalOcean Valkey in the deployed environment) through a dedicated dispatcher component, and executes jobs in a separate worker process. The API, dispatcher, and worker share a repository and Docker image but run as separate DigitalOcean App Platform components so they can be scaled and configured independently.
 
 **Design principle:** PostgreSQL is the source of truth for job lifecycle state. Redis Streams is the delivery/dispatch mechanism, not the authoritative job record.
 
@@ -120,14 +120,14 @@ flowchart TB
     API -->|11. Set drain control flag| CONTROL
 ```
 
-The boxes inside the data-services boundary are logical tables/streams, not separate deployed services. The `outbox` table lives in PostgreSQL, while the dispatcher is a background loop running inside the API process. The worker is a separate process/service and can be scaled independently from the API.
+The boxes inside the data-services boundary are logical tables/streams, not separate deployed services. The `outbox` table lives in PostgreSQL. The dispatcher is a separate process/service, alongside the API and worker, and can be scaled independently.
 
 **Responsibilities and data flow**
 
 1. **Client/API consumer:** submits a job with its task type, JSON payload, priority, retry limit, timeout, optional `run_at`, and optional `Idempotency-Key`.
 2. **FastAPI service:** validates the request, checks an idempotency key when supplied, then writes the `jobs` row and its corresponding `outbox` row in one PostgreSQL transaction. It returns `202 Accepted` after the transaction commits; it does not wait for task execution.
 3. **PostgreSQL:** owns the durable job state and enqueue intent. Job status and attempt count remain authoritative here; Redis stream contents are not the source of truth.
-4. **Outbox dispatcher:** polls approximately once per second for unpublished rows whose job is due (`run_at` is absent or has passed). It locks eligible rows with `FOR UPDATE SKIP LOCKED`, publishes each to the priority stream, and records `published_at`.
+4. **Outbox dispatcher:** a dedicated component (`python -m app.dispatcher`) polls approximately once per second for unpublished rows whose job is due (`run_at` is absent or has passed). It locks eligible rows with `FOR UPDATE SKIP LOCKED`, publishes each to the priority stream, and records `published_at`.
 5. **Valkey / Redis Streams:** holds dispatch messages in `jobs:high`, `jobs:normal`, or `jobs:low`. A `job-workers` consumer group distributes new messages to worker consumers. Reading the streams together means strict global priority ordering is not guaranteed.
 6. **Worker:** loads and locks the corresponding PostgreSQL job, skips missing, cancelled, running, or terminal jobs, marks eligible jobs `running`, increments `attempts`, and executes the registered handler in a child process bounded by `timeout_sec`.
 7. **Completion/retry path:** after execution, the worker persists `succeeded` or records the error and either returns the job to `queued` with a new outbox record or marks it `dead_lettered`. It acknowledges the Redis message after persisting the resulting state.
@@ -150,6 +150,7 @@ flowchart TB
 
 The API and worker use the same repository and Dockerfile but different start commands:
 - API: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+- Dispatcher: `python -m app.dispatcher`
 - Worker: `python -m app.worker`
 
 ## 6. Component responsibilities
@@ -159,7 +160,6 @@ The API and worker use the same repository and Dockerfile but different start co
 - Validates requests using Pydantic models.
 - Implements REST endpoints and maps database records to response models.
 - Stores each new job and its outbox record in one PostgreSQL transaction.
-- Runs a periodic outbox publishing loop as part of the API lifespan.
 - Exposes health and Prometheus endpoints.
 - Sets a Redis control flag for the drain/pause operation.
 
@@ -172,8 +172,9 @@ The health endpoint currently reports process health only; it does not actively 
 - Uses SQLAlchemy and a PostgreSQL UUID/JSONB schema.
 - Uses `create_all` at startup for this assignment; a production migration tool and versioned migrations should replace this approach.
 
-### 6.3 Transactional outbox dispatcher
+### 6.3 Transactional outbox dispatcher — `app/dispatcher.py`
 
+- Runs as a standalone process/component, independent of the HTTP API.
 - Selects unpublished outbox rows whose scheduled time is due.
 - Locks rows using `FOR UPDATE SKIP LOCKED`, publishes to the appropriate Redis Stream, and records `published_at`.
 - Runs periodically, allowing an unpublished row to be retried on a later pass after a transient error.
@@ -318,7 +319,7 @@ stateDiagram-v2
 ### Lifecycle narrative
 
 1. **Submission and durable acceptance.** The client calls `POST /jobs`. The API validates the request and, when an `Idempotency-Key` is supplied, returns the existing job for a repeated key. Otherwise, it inserts a `queued` job row and an outbox row in the same PostgreSQL transaction. After commit, the API returns `202 Accepted`; this confirms durable acceptance, not task completion.
-2. **Waiting for eligibility.** For an immediate job, the outbox dispatcher can publish it on its next polling pass. For a scheduled job, the row stays unpublished while `run_at` is in the future. The dispatcher polls about once per second, so the scheduled time is an earliest eligibility time rather than a guarantee of execution at that exact instant.
+2. **Waiting for eligibility.** For an immediate job, the outbox dispatcher can publish it on its next polling pass. For a scheduled job, the row stays unpublished while `run_at` is in the future. The standalone dispatcher polls about once per second by default, so the scheduled time is an earliest eligibility time rather than a guarantee of execution at that exact instant.
 3. **Dispatch.** The dispatcher selects due, unpublished outbox rows, locks them with `FOR UPDATE SKIP LOCKED`, writes a message to the stream for the job's priority, and marks the outbox row published. A transient failure is retried by a later dispatcher pass while the row remains unpublished. Because Redis publication and the PostgreSQL commit cannot be atomic together, duplicate stream messages are possible.
 4. **Claim and start.** The worker reads new messages through the `job-workers` consumer group, loads and locks the job row, and checks that the job is still `queued`. Cancelled, missing, running, or terminal jobs are acknowledged/skipped. For an eligible job, the worker sets status to `running`, increments `attempts`, commits that transition, and executes the task handler in a child process.
 5. **Successful completion.** If the handler finishes within `timeout_sec`, the worker updates the job to `succeeded`, clears its error, persists the updated timestamp, and acknowledges the stream message. The current schema does not persist the handler's result as a job field; the result is logged instead.
@@ -355,13 +356,16 @@ stateDiagram-v2
 | `DATABASE_URL` | API and worker | PostgreSQL connection URL |
 | `REDIS_URL` | API and worker | Redis/Valkey connection URL, including TLS options |
 | `WORKER_CONCURRENCY` | Worker | Maximum number of concurrent job-processing tasks in one worker process; defaults to 4 |
+| `DISPATCHER_POLL_INTERVAL_SEC` | Dispatcher | Seconds between outbox polling passes; defaults to 1 |
+| `DISPATCHER_BATCH_SIZE` | Dispatcher | Maximum outbox rows selected per polling pass; defaults to 100 |
 | `LOG_LEVEL` | API and worker | Logging level; defaults to `INFO` |
 
 Use the provider's private networking and TLS connection details where available. Store credentials as App Platform environment variables marked secret. Do not put live credentials in this document or in source control.
 
 ## 11. Scaling and operations
 
-- Scale API instances according to request rate and latency.
+- Scale API instances according to request rate and latency; API instances no longer run the outbox polling loop.
+- Scale dispatcher instances according to outbox age, batch processing time, and publish throughput. `FOR UPDATE SKIP LOCKED` allows multiple dispatcher replicas to work on different rows, though duplicate publication remains possible across the Redis/PostgreSQL commit boundary.
 - Scale worker containers and per-container concurrency according to queue age, job duration, CPU/memory, and downstream limits.
 - Keep PostgreSQL connection-pool limits in mind when increasing worker count; each process has its own pool.
 - Monitor submission rate, oldest queued-job age, pending outbox count, retries, dead-letter rate, task latency, worker restarts, and database connection pressure.
@@ -399,7 +403,7 @@ A worker can crash after performing an external side effect but before durably r
 ### How does each component scale under load?
 
 - **API tier:** add App Platform API instances for higher HTTP request volume. Keep request handlers short and let PostgreSQL commit be the acceptance boundary. The API process currently also hosts an outbox polling loop, so additional API replicas add dispatcher loops as well; row locking with `FOR UPDATE SKIP LOCKED` coordinates concurrent dispatchers. Watch request latency, database pool usage, and outbox lag.
-- **Outbox dispatcher:** it currently polls about once per second inside each API process. For a larger workload, measure poll duration and outbox age, tune batch sizes and polling cadence, and consider moving dispatch into a dedicated service so it can be scaled independently. Avoid unbounded batches that hold database locks for too long.
+- **Outbox dispatcher:** it runs as a dedicated service and polls about once per second by default. Scale dispatcher replicas if outbox age rises, tune `DISPATCHER_BATCH_SIZE` and `DISPATCHER_POLL_INTERVAL_SEC`, and avoid unbounded batches that hold database locks for too long. `FOR UPDATE SKIP LOCKED` coordinates concurrent dispatcher replicas.
 - **Worker tier:** add worker containers to increase parallel processing capacity. Each worker defaults to `WORKER_CONCURRENCY=4`, so approximate total in-flight capacity is worker replicas multiplied by concurrency, subject to CPU, memory, handler duration, database connections, and downstream service limits. Increase concurrency gradually and measure throughput and queue age rather than assuming linear scaling.
 - **PostgreSQL:** this is likely to become a shared bottleneck because API submissions, dispatcher polling, and worker state transitions all use it. Monitor CPU, I/O, lock waits, query latency, connection count, and pool saturation. Add appropriate indexes, bound per-process connection pools, tune queries/batches, and scale the managed database when measurements justify it.
 - **Valkey / Redis Streams:** streams buffer dispatch work between producers and consumers. Monitor stream growth, pending entries, publish errors, and consumer lag. More workers help only if worker execution is the bottleneck; they will not fix database saturation or a rate-limited downstream dependency. Add pending-message reclaim and worker-crash recovery before relying on the queue for production workloads.
