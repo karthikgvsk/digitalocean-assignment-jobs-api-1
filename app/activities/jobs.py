@@ -1,7 +1,6 @@
 """Activity layer: HTTP routes, request validation, and response mapping."""
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any
@@ -20,7 +19,6 @@ from app.services import (
 )
 
 router = APIRouter()
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 
 class Priority(str, Enum):
@@ -102,7 +100,15 @@ def submit_job(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JobView:
     try:
-        job, replayed = services.submit_job(request, idempotency_key)
+        job, replayed = services.submit_job(
+            task_type=request.task_type,
+            payload=request.payload,
+            priority=request.priority.value,
+            max_retries=request.max_retries,
+            timeout_sec=request.timeout_sec,
+            run_at=request.run_at,
+            idempotency_key=idempotency_key,
+        )
     except Exception as exc:
         _raise_http_error(exc)
     if replayed:
