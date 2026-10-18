@@ -1,6 +1,6 @@
 """SQLAlchemy models and database helpers."""
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy import DateTime, Integer, String, Text, create_engine
@@ -13,7 +13,7 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Base(DeclarativeBase):
