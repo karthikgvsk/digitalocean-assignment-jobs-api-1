@@ -501,3 +501,241 @@ Not yet proven. CI validates linting, unit/integration behavior, and the Docker 
 - Redis Streams/Valkey is used for dispatch and consumer coordination.
 - The service provides at-least-once dispatch semantics; exactly-once arbitrary side effects are not guaranteed.
 - The initial target is a small assignment deployment on DigitalOcean App Platform, with API and worker components independently deployed from one repository.
+
+## 15. Low-level design: class and module structure
+
+This section describes the concrete Python structure in the repository. The implementation is intentionally function-oriented in several layers rather than forcing every operation into a class. The UML below shows the actual classes and their relationships; module-level functions are listed separately.
+
+### 15.1 Package and dependency structure
+
+```text
+app/
+├── main.py                 # FastAPI bootstrap, lifespan, health and metrics routes
+├── activities/
+│   ├── __init__.py
+│   └── jobs.py             # HTTP routes, Pydantic DTOs, HTTP/domain-error mapping
+├── services.py             # Business rules and application use cases
+├── repositories.py         # PostgreSQL queries and transaction boundaries
+├── db.py                   # SQLAlchemy engine, session factory, ORM models
+├── resilience.py            # Database retry policy and Redis client factory
+├── metrics.py               # Shared Prometheus counters
+├── dispatcher.py            # Standalone transactional-outbox publisher process
+└── worker.py                # Stream consumer, task execution and lifecycle transitions
+```
+
+The normal API call direction is `activities/jobs.py -> services.py -> repositories.py -> db.py`. Cross-cutting resilience helpers are used by the repository and by the dispatcher/worker Redis clients. The dispatcher and worker are independent process entry points; they do not call the HTTP activity layer.
+
+### 15.2 Core domain and DTO class diagram
+
+```mermaid
+classDiagram
+    class Base {
+        <<SQLAlchemy DeclarativeBase>>
+    }
+    class Job {
+        +UUID id
+        +str task_type
+        +dict payload
+        +str priority
+        +str status
+        +int attempts
+        +int max_retries
+        +int timeout_sec
+        +datetime run_at
+        +datetime created_at
+        +datetime updated_at
+        +str error
+        +str idempotency_key
+    }
+    class Outbox {
+        +UUID id
+        +UUID job_id
+        +str stream
+        +dict payload
+        +datetime created_at
+        +datetime published_at
+    }
+    class Priority {
+        <<Enum>>
+        high
+        normal
+        low
+    }
+    class JobStatus {
+        <<Enum>>
+        queued
+        running
+        succeeded
+        failed
+        dead_lettered
+        cancelled
+    }
+    class JobCreate {
+        <<Pydantic DTO>>
+        +str task_type
+        +dict payload
+        +Priority priority
+        +int max_retries
+        +int timeout_sec
+        +datetime run_at
+    }
+    class JobView {
+        <<Pydantic DTO>>
+        +UUID id
+        +str task_type
+        +dict payload
+        +Priority priority
+        +JobStatus status
+        +int attempts
+        +int max_retries
+        +int timeout_sec
+        +datetime run_at
+        +datetime created_at
+        +datetime updated_at
+        +str error
+    }
+    class DrainRequest {
+        <<Pydantic DTO>>
+        +bool confirm
+    }
+    Base <|-- Job
+    Base <|-- Outbox
+    JobCreate ..> Priority
+    JobView ..> Priority
+    JobView ..> JobStatus
+    Job "1" <-- "0..*" Outbox : job_id reference
+```
+
+**Persistence notes:** `Job` and `Outbox` are SQLAlchemy ORM models declared in `app/db.py`; `JobCreate`, `JobView`, `DrainRequest`, `Priority`, and `JobStatus` are request/response types in `app/activities/jobs.py`. The database schema does not currently declare a foreign-key constraint from `Outbox.job_id` to `Job.id`; the relationship in the diagram is logical. `JobView` intentionally omits a persisted task-result field because the current schema does not store results.
+
+### 15.3 Activity layer — `app/activities/jobs.py`
+
+**Types**
+- `Priority`: string enum validating `high`, `normal`, or `low`.
+- `JobStatus`: string enum used for response status and the optional list filter.
+- `JobCreate`: validates task type, JSON payload, priority, retry limit, timeout, and optional schedule.
+- `JobView`: public representation of a persisted job; constructed by `as_view(job)`.
+- `DrainRequest`: requires explicit `confirm=true` before the drain action.
+
+**Route functions and responsibilities**
+| Function / route | Responsibility |
+|---|---|
+| `submit_job()` — `POST /jobs` | Calls `services.submit_job()`, returns `202`, and sets `Idempotency-Replayed: true` for replayed submissions. |
+| `list_jobs()` — `GET /jobs` | Validates status and limit, delegates query, converts rows to `JobView`. |
+| `get_job()` — `GET /jobs/{job_id}` | Parses UUID and returns one job. |
+| `cancel_job()` — `DELETE /jobs/{job_id}` | Delegates cancellation and returns the updated job. |
+| `retry_job()` — `POST /jobs/{job_id}/retry` | Delegates eligibility checks and manual retry. |
+| `queue_depth()` — `GET /queue/depth` | Returns queued PostgreSQL counts grouped by priority. |
+| `drain_queue()` — `POST /queue/drain` | Validates the confirmation DTO and delegates drain control. |
+| `as_view(job)` | Maps ORM fields to the response DTO. |
+| `_raise_http_error(exc)` | Maps domain errors to HTTP 404, 409, 400, or 503; unexpected errors propagate. |
+
+The activity layer should not own SQL statements, transaction management, stream publishing, or retry policy. Request validation failures are handled by FastAPI/Pydantic before the route body executes.
+
+### 15.4 Business logic layer — `app/services.py`
+
+This module implements application use cases as functions, with domain exceptions instead of raising HTTP exceptions.
+
+| Function / type | Responsibility |
+|---|---|
+| `submit_job(...)` | Calls repository creation, increments `JOBS_SUBMITTED` only for a new job, and logs submission. |
+| `list_jobs(status, limit)` | Delegates list/filter query. |
+| `get_job(job_id)` | Converts a missing repository result into `JobNotFoundError`. |
+| `cancel_job(job_id)` | Enforces queued-only cancellation, increments `JOBS_CANCELLED`, and returns the updated job. |
+| `retry_job(job_id)` | Enforces manual-retry eligibility and returns the reset job. |
+| `queue_depth()` | Delegates queue-depth calculation. |
+| `drain_queue(confirm)` | Requires confirmation, writes `jobs:drain=1` to Redis/Valkey, and maps Redis failures to `QueueUnavailableError`. |
+| `JobNotFoundError` | Indicates that the requested job does not exist. |
+| `InvalidJobStateError` | Indicates that an operation is not valid for the job's current state. |
+| `ConfirmationRequiredError` | Indicates that a destructive/operational action lacks explicit confirmation. |
+| `QueueUnavailableError` | Indicates that queue-control storage is unavailable. |
+
+This layer is transport-independent: it does not depend on FastAPI response classes. A future CLI, scheduled operation, or alternate API can reuse the use cases without duplicating lifecycle rules.
+
+### 15.5 Model and repository layer — `app/repositories.py` and `app/db.py`
+
+**Database setup in `app/db.py`**
+- `Base`: SQLAlchemy `DeclarativeBase` for mapped models.
+- `Job`: canonical job lifecycle record, including idempotency key and attempt metadata.
+- `Outbox`: durable intent to publish a job to a stream, with `published_at` as the publication marker.
+- `engine`: PostgreSQL engine configured with connection, pool, and statement timeouts.
+- `SessionLocal`: session factory configured with `expire_on_commit=False`.
+- `utcnow()`: returns a timezone-aware UTC timestamp.
+
+**Repository operations in `app/repositories.py`**
+| Function | Transaction/data responsibility |
+|---|---|
+| `create_job(...)` | Creates a `Job` and matching `Outbox` row in one transaction; checks the idempotency key; reuses a stable job UUID across transient retries. |
+| `list_jobs(status, limit)` | Reads newest jobs, optionally filtered by status. |
+| `get_job(job_id)` | Reads one job by primary key. |
+| `cancel_job(job_id)` | Locks the row with `FOR UPDATE`, changes only queued jobs to cancelled, and commits. |
+| `queue_depth()` | Counts queued jobs per priority from PostgreSQL. |
+| `retry_job(job_id)` | Locks the job, permits failed/dead-lettered jobs, resets state, and inserts a new outbox row in one transaction. |
+| `_run_db(operation, name)` | Wraps repository operations with the shared transient-database retry helper. |
+
+Repository functions own SQLAlchemy sessions and transaction boundaries. Callers receive ORM objects or simple values; domain-level eligibility errors are raised by the service layer. The dispatcher and worker use the same ORM models/session factory but perform their specialized transactions in their own modules.
+
+### 15.6 Resilience and metrics — `app/resilience.py`, `app/metrics.py`
+
+**Resilience module**
+- `is_retryable_database_error(exc)`: retries database transport/connection errors (`OperationalError`, `InterfaceError`, `TimeoutError`, and invalidated `DBAPIError`); does not classify integrity/constraint errors as transient.
+- `retry_transient(operation, should_retry, operation_name, attempts)`: executes a bounded retry loop with capped exponential backoff and full jitter; logs retry metadata and re-raises when exhausted.
+- `create_redis_client(url)`: builds a Redis/Valkey client with socket connect/read timeouts, retry support for connection/timeouts, response decoding, and periodic health checks.
+- Module constants read retry and Redis timeout configuration from environment variables at import time.
+
+**Metrics module**
+- `JOBS_SUBMITTED`: Prometheus counter `jobs_submitted_total`.
+- `JOBS_CANCELLED`: Prometheus counter `jobs_cancelled_total`.
+- `app/main.py` exposes Prometheus output through `GET /metrics`.
+
+The retry helper should only wrap operations that can be safely repeated. Retrying a whole worker task can duplicate external side effects, so the current worker uses bounded network timeouts but does not automatically retry its full lifecycle transaction as one unit.
+
+### 15.7 Dispatcher component — `app/dispatcher.py`
+
+This is a standalone process built from module-level functions rather than a dispatcher class.
+
+| Function / constant | Responsibility |
+|---|---|
+| `stop(signum, frame)` | Sets the shutdown flag when SIGTERM/SIGINT arrives. |
+| `_publish_outbox_once()` | Creates a bounded Redis client; selects due unpublished outbox rows using `FOR UPDATE SKIP LOCKED`; publishes each with `XADD`; marks rows published; commits the transaction; logs remaining backlog. |
+| `publish_outbox_once()` | Calls the batch operation through `retry_transient()` for transient database failures. |
+| `main()` | Registers signal handlers, ensures database tables exist, repeatedly publishes batches, logs failures, and waits interruptibly between polls. |
+| `POLL_INTERVAL_SEC` | Configurable delay between polling passes. |
+| `BATCH_SIZE` | Maximum number of outbox records processed in one pass. |
+
+The dispatcher publishes before the PostgreSQL transaction commits. If Redis accepts an `XADD` but the database transaction fails, the next pass can publish the same logical job again. Consumers must therefore be duplicate-tolerant.
+
+### 15.8 Worker component — `app/worker.py`
+
+The worker also uses module-level functions rather than a worker class.
+
+| Function / constant | Responsibility |
+|---|---|
+| `stop(signum, frame)` | Signals the polling loop to stop claiming additional work. |
+| `execute_task(task_type, payload)` | Dispatches the registered sample handlers: `echo`, `sleep`, and `fail`; rejects unknown task types. |
+| `_run_in_child(connection, task_type, payload)` | Executes a handler in a child process and sends success/result or failure/error through a pipe. |
+| `execute_with_timeout(task_type, payload, timeout_sec)` | Starts the child process, enforces the deadline, terminates/kills an overrun process, and returns the result or raises an error. |
+| `ensure_groups(client)` | Creates the `job-workers` consumer group for each priority stream; ignores the already-exists response. |
+| `process(client, stream, message_id, fields)` | Validates the message, locks and checks the PostgreSQL job, marks it running and increments attempts, executes the task, persists success or retry/dead-letter state, and acknowledges the stream message after durable state update. |
+| `main()` | Creates the Redis client and consumer groups, manages a bounded `ThreadPoolExecutor`, checks drain state, reads stream messages, collects task futures, and shuts down cleanly. |
+| `STREAMS`, `GROUP`, `CONSUMER`, `CONCURRENCY` | Define priority streams, consumer group, per-process consumer identity, and maximum concurrent jobs. |
+
+Concurrency is split across two levels: the main worker loop uses a thread pool to process multiple messages, while each task attempt runs in its own child process for timeout enforcement. The current task registry is a conditional function, not a plugin framework; adding a new task requires extending `execute_task()` and adding tests. Pending-message reclaim and reconciliation of jobs stranded in `running` after a crash remain future work.
+
+### 15.9 Bootstrap and process entry points — `app/main.py`
+
+- `lifespan(app)`: creates tables at API startup for this assignment and yields to the FastAPI lifecycle.
+- `app`: FastAPI instance with the jobs router registered.
+- `health()`: returns a basic process-health response.
+- `metrics()`: returns Prometheus exposition output with the correct content type.
+- `REDIS_URL`: retained as a module-level compatibility setting for existing tests/imports.
+
+**Deployment commands**
+| Component | Entry point | Primary responsibility |
+|---|---|---|
+| API | `uvicorn app.main:app --host 0.0.0.0 --port 8000` | HTTP routes, validation, use-case invocation, health and metrics. |
+| Dispatcher | `python -m app.dispatcher` | Move due outbox records from PostgreSQL to Redis Streams. |
+| Worker | `python -m app.worker` | Consume stream messages and execute jobs. |
+
+All three components use the same codebase and environment configuration, but have separate process lifecycles and should be configured as separate DigitalOcean App Platform components. PostgreSQL remains the source of truth; Redis/Valkey provides dispatch and drain-control state.
+
